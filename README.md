@@ -86,8 +86,9 @@ proves it is correct. Neither half needs the device.
 spike2/run.sh
 ```
 
-Current vectors: FIPS 180-4 for SHA-256, RFC 8439 §2.4.2 / §2.5.2 / §2.8.2 for
-ChaCha20, Poly1305, and the AEAD construction.
+Current vectors: FIPS 180-4 for SHA-256 and SHA-512, RFC 8439 §2.4.2 / §2.5.2 /
+§2.8.2 for ChaCha20, Poly1305 and the AEAD construction, RFC 7748 §5.2 / §6.1
+for X25519, and RFC 8032 §7.1 plus negative cases for Ed25519. 28 in total.
 
 ## Measured on the device
 
@@ -116,9 +117,9 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
 ## Status
 
 - [x] MIDlet builds, installs over the air, and runs on a Bold 9790
-- [x] SHA-256, ChaCha20, Poly1305, ChaCha20-Poly1305 AEAD
-- [ ] X25519 key agreement
-- [ ] Ed25519 signature verification
+- [x] SHA-256, SHA-512, ChaCha20, Poly1305, ChaCha20-Poly1305 AEAD
+- [x] X25519 key agreement
+- [x] Ed25519 signature verification, and SHA-512
 - [ ] SSH transport: version exchange, binary packet protocol, KEXINIT
 - [ ] `chacha20-poly1305@openssh.com` packet layer
 - [ ] User authentication
