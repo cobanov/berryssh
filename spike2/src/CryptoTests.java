@@ -1,6 +1,8 @@
 import berryssh.crypto.ChaCha20;
 import berryssh.crypto.Poly1305;
+import berryssh.crypto.Ed25519;
 import berryssh.crypto.SHA256;
+import berryssh.crypto.SHA512;
 import berryssh.crypto.X25519;
 
 /**
@@ -21,6 +23,8 @@ public class CryptoTests {
         poly1305Vector();
         aeadVector();
         x25519Vectors();
+        sha512Vectors();
+        ed25519Vectors();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -175,6 +179,88 @@ public class CryptoTests {
         } else {
             failed++;
             System.out.println("  FAIL  X25519 all-zero shared secret detected");
+        }
+    }
+
+    private static void sha512Vectors() {
+        check("SHA-512 empty", SHA512.hash(new byte[0]),
+            "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce"
+          + "47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e");
+        check("SHA-512 abc", SHA512.hash(ascii("abc")),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+          + "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
+        // Crosses the 112-byte padding boundary, where the length field forces
+        // an extra block.
+        check("SHA-512 two-block", SHA512.hash(ascii(
+                "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn"
+              + "hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu")),
+            "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018"
+          + "501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909");
+    }
+
+    /** RFC 8032 section 7.1. */
+    private static void ed25519Vectors() {
+        // TEST 1: empty message.
+        boolean ok = Ed25519.verify(
+            hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"),
+            new byte[0],
+            hex("e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+              + "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"));
+        report("Ed25519 RFC 8032 TEST 1 (empty message)", ok);
+
+        // TEST 2: one-byte message.
+        ok = Ed25519.verify(
+            hex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"),
+            hex("72"),
+            hex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+              + "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"));
+        report("Ed25519 RFC 8032 TEST 2 (1-byte message)", ok);
+
+        // TEST 3: two-byte message.
+        ok = Ed25519.verify(
+            hex("fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025"),
+            hex("af82"),
+            hex("6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac"
+              + "18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"));
+        report("Ed25519 RFC 8032 TEST 3 (2-byte message)", ok);
+
+        // A verifier that ignores its inputs passes every positive vector, so
+        // the negative cases are the ones that actually test anything.
+        byte[] pk = hex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c");
+        byte[] sig = hex("92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+                       + "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00");
+
+        byte[] flipped = new byte[64];
+        System.arraycopy(sig, 0, flipped, 0, 64);
+        flipped[10] ^= 0x01;
+        report("Ed25519 rejects a flipped signature bit",
+            !Ed25519.verify(pk, hex("72"), flipped));
+
+        report("Ed25519 rejects a modified message",
+            !Ed25519.verify(pk, hex("73"), sig));
+
+        byte[] wrongKey = hex("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
+        report("Ed25519 rejects the wrong public key",
+            !Ed25519.verify(wrongKey, hex("72"), sig));
+
+        // S must be below the group order, or a signature can be reshaped.
+        byte[] highS = new byte[64];
+        System.arraycopy(sig, 0, highS, 0, 64);
+        for (int i = 32; i < 64; i++) {
+            highS[i] = (byte) 0xff;
+        }
+        report("Ed25519 rejects S >= L", !Ed25519.verify(pk, hex("72"), highS));
+
+        report("Ed25519 rejects a malformed length", !Ed25519.verify(pk, hex("72"), hex("00")));
+    }
+
+    private static void report(String name, boolean ok) {
+        if (ok) {
+            passed++;
+            System.out.println("  PASS  " + name);
+        } else {
+            failed++;
+            System.out.println("  FAIL  " + name);
         }
     }
 
