@@ -1,6 +1,7 @@
 import berryssh.crypto.ChaCha20;
 import berryssh.crypto.Poly1305;
 import berryssh.crypto.SHA256;
+import berryssh.crypto.X25519;
 
 /**
  * Spike 2 test vectors. The crypto sources are compiled against the CLDC 1.1
@@ -19,6 +20,7 @@ public class CryptoTests {
         chacha20Vector();
         poly1305Vector();
         aeadVector();
+        x25519Vectors();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -118,6 +120,62 @@ public class CryptoTests {
         mac.padToBlock();
         mac.update(lengthsBlock(aad.length, ciphertext.length), 0, 16);
         check("AEAD tag", mac.finish(), "1ae10b594f09e26a7e902ecbd0600691");
+    }
+
+    /** RFC 7748 sections 5.2 and 6.1. */
+    private static void x25519Vectors() {
+        // Section 5.2: raw scalar multiplication.
+        check("X25519 RFC 7748 5.2 #1",
+            X25519.scalarMult(
+                hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"),
+                hex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c")),
+            "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
+
+        check("X25519 RFC 7748 5.2 #2",
+            X25519.scalarMult(
+                hex("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"),
+                hex("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493")),
+            "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957");
+
+        // Section 6.1: both sides of a key exchange must land on the same secret.
+        byte[] alicePriv = hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        byte[] bobPriv = hex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+
+        byte[] alicePub = X25519.scalarMultBase(alicePriv);
+        byte[] bobPub = X25519.scalarMultBase(bobPriv);
+        check("X25519 RFC 7748 6.1 Alice public", alicePub,
+            "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+        check("X25519 RFC 7748 6.1 Bob public", bobPub,
+            "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f");
+
+        String expectedShared =
+            "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742";
+        check("X25519 RFC 7748 6.1 Alice computes shared",
+            X25519.scalarMult(alicePriv, bobPub), expectedShared);
+        check("X25519 RFC 7748 6.1 Bob computes shared",
+            X25519.scalarMult(bobPriv, alicePub), expectedShared);
+
+        // Section 5.2 iterated: k = u = base, one round.
+        byte[] k = hex("0900000000000000000000000000000000000000000000000000000000000000");
+        byte[] u = hex("0900000000000000000000000000000000000000000000000000000000000000");
+        for (int i = 0; i < 1; i++) {
+            byte[] next = X25519.scalarMult(k, u);
+            u = k;
+            k = next;
+        }
+        check("X25519 RFC 7748 5.2 iter 1", k,
+            "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
+
+        // A low-order point drives the shared secret to zero and must be rejected.
+        byte[] lowOrder = hex("0000000000000000000000000000000000000000000000000000000000000000");
+        boolean rejected = X25519.isAllZero(X25519.scalarMult(alicePriv, lowOrder));
+        if (rejected) {
+            passed++;
+            System.out.println("  PASS  X25519 all-zero shared secret detected");
+        } else {
+            failed++;
+            System.out.println("  FAIL  X25519 all-zero shared secret detected");
+        }
     }
 
     private static byte[] lengthsBlock(int aadLength, int ciphertextLength) {
