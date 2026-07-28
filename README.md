@@ -1,0 +1,152 @@
+# berryssh
+
+An SSH client for BlackBerry OS 7.x, written as a plain MIDP 2.0 / CLDC 1.1
+MIDlet.
+
+It speaks `curve25519-sha256`, `ssh-ed25519`, and
+`chacha20-poly1305@openssh.com` — the algorithms a current OpenSSH offers by
+default, so a twenty-year-old handset can reach a modern server without that
+server being weakened to meet it.
+
+Target hardware is a BlackBerry Bold 9790: a 480×360 screen, a hardware QWERTY
+keyboard, and a real terminal on it.
+
+## Design
+
+**No RIM APIs.** Everything is standard MIDP and CLDC. This is a deliberate
+constraint, not a portability exercise: BlackBerry code signing is a runtime
+check inside the device VM that fires when a module touches a protected API, and
+every signature had to be issued by BlackBerry's signing authority, which no
+longer exists. Code that touches no protected API needs no signature. It also
+means the build needs no BlackBerry tooling at all.
+
+**Crypto from scratch.** CLDC 1.1 has no `java.security`, no `javax.crypto`, and
+no `BigInteger`, so the primitives are implemented here. The modern algorithms
+make that tractable rather than harder:
+
+| | Why it suits this hardware |
+| --- | --- |
+| `curve25519-sha256` | Fixed 32-byte field arithmetic instead of 2048-bit modular exponentiation, and no `BigInteger` |
+| `ssh-ed25519` | Same curve arithmetic, nothing extra to carry |
+| `chacha20-poly1305` | Pure 32-bit add/xor/rotate, no lookup tables; AEAD, so no separate MAC |
+| `SHA-256` | Small and self-contained |
+
+The classic 2011 SSH stack is anchored on 2048-bit modexp, which is genuinely
+slow in interpreted Java on this class of CPU. Modern cryptography is the
+cheaper option here, not the more expensive one.
+
+## Building
+
+No BlackBerry SDK is involved. Dependencies are fetched, not vendored:
+
+```sh
+lib/fetch.sh          # MIDP/CLDC API stubs and ProGuard, from Maven Central
+spike1/build.sh       # -> spike1/out/Probe.jad + Probe.jar
+```
+
+- **API stubs**: microemu's `cldcapi11` / `midpapi20`
+- **Compiler**: JDK 8 in a container at `-source 1.3 -target 1.3`; the host JDK
+  17 cannot emit class file version 47, which is what CLDC wants
+- **Preverifier**: ProGuard's `-microedition` mode
+
+### The preverification trap
+
+A MIDlet jar that is merely compiled will install and then fail on the device:
+
+```
+907 Invalid JAR — missing stack map in startApp at label 43
+```
+
+CLDC's verifier requires `StackMap` attributes computed ahead of time. Modern
+`javac` emits `StackMapTable` (the Java 6+ format) or nothing at this target, so
+a preverification pass is mandatory. ProGuard's `-microedition` mode produces
+them without needing a native preverifier binary.
+
+## Installing
+
+`tools/ota_server.py` serves a build with the MIME types the device requires — a
+generic static server renders the descriptor as text instead of installing it.
+Plain HTTP is deliberate: the OS 7 browser's trust store predates every
+currently issued CA.
+
+```sh
+python3 tools/ota_server.py spike1/out
+```
+
+Then open the printed URL in the device's native browser, over Wi-Fi.
+
+## Verification
+
+`spike2/run.sh` compiles the crypto against the CLDC bootclasspath at
+`-source 1.3`, then runs its test vectors on the host JVM. Compiling under the
+device's constraints proves the code will run there; executing on the host
+proves it is correct. Neither half needs the device.
+
+```sh
+spike2/run.sh
+```
+
+Current vectors: FIPS 180-4 for SHA-256, RFC 8439 §2.4.2 / §2.5.2 / §2.8.2 for
+ChaCha20, Poly1305, and the AEAD construction.
+
+## Measured on the device
+
+`spike1` is a capability probe rather than a hello world. On a Bold 9790:
+
+| | |
+| --- | --- |
+| Canvas | 480×360, full screen |
+| Default encoding | `ISO8859_1` — so UTF-8 is converted in our own code |
+| Colour | 24-bit |
+| Free heap | ~357 MB — memory is not a constraint |
+| MIDP monospace cell | 22×27 px, giving a 21×13 terminal |
+
+That last row is why the terminal renders from a bitmap font atlas rather than a
+system font: MIDP exposes only three font sizes and the smallest is far too
+large here. An 8×14 cell gives the 60×25 terminal this screen should have.
+
+## Layout
+
+    lib/            dependency fetcher
+    ssh/src/        the client library
+    spike1/         device capability probe
+    spike2/         crypto test vectors
+    tools/          OTA server
+
+## Status
+
+- [x] MIDlet builds, installs over the air, and runs on a Bold 9790
+- [x] SHA-256, ChaCha20, Poly1305, ChaCha20-Poly1305 AEAD
+- [ ] X25519 key agreement
+- [ ] Ed25519 signature verification
+- [ ] SSH transport: version exchange, binary packet protocol, KEXINIT
+- [ ] `chacha20-poly1305@openssh.com` packet layer
+- [ ] User authentication
+- [ ] Channels, `pty-req`, shell
+- [ ] Terminal emulation and UI
+
+## Prior art
+
+[BBSSH](https://github.com/marcparadise/bbssh) by Marc Paradise was the SSH
+client for these devices, and it solved a lot of problems well. berryssh is a
+separate implementation — different architecture, different algorithms — but it
+borrows from BBSSH where BBSSH already got it right, and those parts are
+credited in the files that use them.
+
+What is taken, or planned to be:
+
+- **`VT320`** — the terminal emulator, originally from
+  [JTA](http://javatelnet.org/) by Matthias L. Jugel and Marcus Meissner. It has
+  no platform dependencies at all, which makes it portable as-is.
+- **`BitmapFont`** — the subpixel-antialiased bitmap font renderer, derived from
+  Roar Lauritzsen's LCDFont. Its atlas layout and `drawRGB` approach map
+  directly onto MIDP.
+- **Font atlases** — the Bitstream Vera Sans Mono and Anonymous renderings.
+  Their proprietary siblings (Courier New, Lucida Console) are not used.
+
+A verified copy of BBSSH, including binaries that survive nowhere else, is
+preserved at [cobanov/bbssh-archive](https://github.com/cobanov/bbssh-archive).
+
+## Licence
+
+GPL-2.0-or-later, matching BBSSH, whose code this project reuses.
