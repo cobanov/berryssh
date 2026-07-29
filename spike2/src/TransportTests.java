@@ -1,4 +1,6 @@
 import berryssh.protocol.Ascii;
+import berryssh.protocol.KexInit;
+import berryssh.protocol.Negotiation;
 import berryssh.protocol.SshException;
 import berryssh.protocol.Transport;
 import berryssh.protocol.WireReader;
@@ -42,6 +44,8 @@ public class TransportTests {
         packetFraming();
         versionExchange();
         malformedInput();
+        kexInitEncoding();
+        negotiationRules();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -309,6 +313,137 @@ public class TransportTests {
             () -> new WireReader(hex("7fffffff00")).readString());
         checkRejected("a negative mpint is refused",
             () -> new WireReader(hex("00000002edcc")).readMpint());
+    }
+
+    /** The payload is hashed byte for byte during the key exchange, so it is pinned here. */
+    private static void kexInitEncoding() {
+        byte[] cookie = new byte[16];
+        for (int i = 0; i < 16; i++) {
+            cookie[i] = (byte) i;
+        }
+        check("KEXINIT payload",
+            KexInit.clientWithCookie(cookie).payload(),
+            "14000102030405060708090a0b0c0d0e0f"
+                + "0000002e637572766532353531392d7368613235362c"
+                + "637572766532353531392d736861323536406c69627373682e6f7267"
+                + "0000000b7373682d65643235353139"
+                + "0000001d63686163686132302d706f6c7931333035406f70656e7373682e636f6d"
+                + "0000001d63686163686132302d706f6c7931333035406f70656e7373682e636f6d"
+                + "0000000d686d61632d736861322d323536"
+                + "0000000d686d61632d736861322d323536"
+                + "000000046e6f6e65000000046e6f6e65"
+                + "0000000000000000"
+                + "00"
+                + "00000000");
+
+        try {
+            KexInit parsed = KexInit.parse(KexInit.clientWithCookie(cookie).payload());
+            checkTrue("KEXINIT parses back to the lists it was built from",
+                parsed.kexAlgorithms().length == 2
+                    && "curve25519-sha256".equals(parsed.kexAlgorithms()[0])
+                    && "curve25519-sha256@libssh.org".equals(parsed.kexAlgorithms()[1])
+                    && "ssh-ed25519".equals(parsed.hostKeyAlgorithms()[0])
+                    && "chacha20-poly1305@openssh.com".equals(parsed.ciphersServerToClient()[0])
+                    && "none".equals(parsed.compressionClientToServer()[0])
+                    && !parsed.firstKexPacketFollows());
+        } catch (IOException e) {
+            fail("KEXINIT round trip threw " + e);
+        }
+
+        checkRejected("a payload that is not a KEXINIT is refused",
+            () -> KexInit.parse(hex("15000102030405060708090a0b0c0d0e0f")));
+    }
+
+    private static void negotiationRules() {
+        try {
+            // Our order decides, not the server's. The server here prefers the
+            // libssh name; we prefer the standardised one, so ours wins.
+            Negotiation n = Negotiation.between(clientKexInit(), serverKexInit(
+                new String[] { "curve25519-sha256@libssh.org", "curve25519-sha256" },
+                new String[] { "rsa-sha2-512", "ssh-ed25519" },
+                new String[] { "aes128-ctr", "chacha20-poly1305@openssh.com" },
+                false));
+            checkTrue("negotiation follows the client's preference order",
+                "curve25519-sha256".equals(n.kex())
+                    && "ssh-ed25519".equals(n.hostKey())
+                    && "chacha20-poly1305@openssh.com".equals(n.cipherClientToServer())
+                    && "chacha20-poly1305@openssh.com".equals(n.cipherServerToClient())
+                    && "none".equals(n.compressionServerToClient()));
+            checkTrue("nothing is discarded when the server did not guess",
+                !n.discardGuessedPacket());
+
+            // A server that guesses correctly: its first preferences match what
+            // was negotiated, so the packet it sent ahead is valid.
+            Negotiation right = Negotiation.between(clientKexInit(), serverKexInit(
+                new String[] { "curve25519-sha256" },
+                new String[] { "ssh-ed25519" },
+                new String[] { "chacha20-poly1305@openssh.com" },
+                true));
+            checkTrue("a correct guess is kept", !right.discardGuessedPacket());
+
+            // A server that guesses wrongly: its first kex is not the negotiated
+            // one, so the packet it sent ahead has to be read and dropped, or
+            // everything after it is one message out of step.
+            Negotiation wrong = Negotiation.between(clientKexInit(), serverKexInit(
+                new String[] { "curve25519-sha256@libssh.org", "curve25519-sha256" },
+                new String[] { "ssh-ed25519" },
+                new String[] { "chacha20-poly1305@openssh.com" },
+                true));
+            checkTrue("a wrong guess marks the next packet for discard",
+                wrong.discardGuessedPacket());
+        } catch (IOException e) {
+            fail("negotiation threw " + e);
+        }
+
+        checkRejected("no key exchange in common is refused",
+            () -> Negotiation.between(clientKexInit(), serverKexInit(
+                new String[] { "diffie-hellman-group14-sha1" },
+                new String[] { "ssh-ed25519" },
+                new String[] { "chacha20-poly1305@openssh.com" },
+                false)));
+
+        checkRejected("no host key algorithm in common is refused",
+            () -> Negotiation.between(clientKexInit(), serverKexInit(
+                new String[] { "curve25519-sha256" },
+                new String[] { "ssh-rsa", "ecdsa-sha2-nistp256" },
+                new String[] { "chacha20-poly1305@openssh.com" },
+                false)));
+
+        // Refusing this is what keeps the packet layer authenticated: an
+        // agreement on a non-AEAD cipher would need a separate MAC we do not have.
+        checkRejected("a cipher with no AEAD is refused",
+            () -> Negotiation.between(clientKexInit(), serverKexInit(
+                new String[] { "curve25519-sha256" },
+                new String[] { "ssh-ed25519" },
+                new String[] { "aes128-ctr" },
+                false)));
+    }
+
+    private static KexInit clientKexInit() {
+        return KexInit.clientWithCookie(new byte[16]);
+    }
+
+    /** Builds a server KEXINIT with arbitrary lists, by way of the wire format. */
+    private static KexInit serverKexInit(String[] kex, String[] hostKey, String[] ciphers,
+                                         boolean guessing) throws IOException {
+        String[] macs = { "hmac-sha2-256", "hmac-sha1" };
+        String[] compression = { "none", "zlib@openssh.com" };
+        WireWriter w = new WireWriter(512);
+        w.writeByte(20);
+        w.writeRaw(new byte[16]);
+        w.writeNameList(kex);
+        w.writeNameList(hostKey);
+        w.writeNameList(ciphers);
+        w.writeNameList(ciphers);
+        w.writeNameList(macs);
+        w.writeNameList(macs);
+        w.writeNameList(compression);
+        w.writeNameList(compression);
+        w.writeNameList(new String[0]);
+        w.writeNameList(new String[0]);
+        w.writeBoolean(guessing);
+        w.writeUint32(0);
+        return KexInit.parse(w.toByteArray());
     }
 
     private static Transport transportOver(String ascii) {

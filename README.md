@@ -90,11 +90,26 @@ spike2/run.sh
 §2.8.2 for ChaCha20, Poly1305 and the AEAD construction, RFC 7748 §5.2 / §6.1
 for X25519, and RFC 8032 §7.1 plus negative cases for Ed25519. 28 in total.
 
-**Transport**: RFC 4251 §5 for the wire types and RFC 4253 §6 for the packet
-framing, plus the version exchange and the paths that have to reject malformed
-input. 47 in total. They run under a Turkish default locale, which is the
-device's own and the setting most likely to break protocol code without raising
-an error anywhere.
+**Transport**: RFC 4251 §5 for the wire types, RFC 4253 §6 for the packet
+framing and §7.1 for algorithm negotiation, plus the version exchange and the
+paths that have to reject malformed input. 57 in total. They run under a Turkish
+default locale, which is the device's own and the setting most likely to break
+protocol code without raising an error anywhere.
+
+### Against a real server
+
+Encodings can be proved offline; a protocol cannot. A key exchange either
+convinces an OpenSSH server or it does not, so the other half of the
+verification talks to one:
+
+```sh
+spike2/against-server.sh          # defaults to the project's container
+```
+
+It is a separate script so that `run.sh` needs nothing external. The container
+still offers the 2011 algorithms as well as the modern ones, which is what
+makes it a useful test: the negotiated set is a choice rather than the only
+thing on the table.
 
 ## Measured on the device
 
@@ -127,7 +142,9 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
 - [x] X25519 key agreement
 - [x] Ed25519 signature verification, and SHA-512
 - [x] SSH transport: version exchange and the binary packet protocol
-- [ ] KEXINIT algorithm negotiation, and the key exchange
+- [x] A random source for key material
+- [x] KEXINIT algorithm negotiation
+- [ ] `curve25519-sha256` key exchange and key derivation
 - [ ] `chacha20-poly1305@openssh.com` packet layer
 - [ ] User authentication
 - [ ] Channels, `pty-req`, shell
