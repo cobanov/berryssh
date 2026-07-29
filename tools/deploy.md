@@ -34,6 +34,16 @@ That does not bind this device, whose browser predates the preload list, so for
 this purpose the Cloudflare redirect is the only obstacle — turning off
 "Always Use HTTPS" for that hostname would be enough.
 
+## The descriptor must never outlive its jar in a cache
+
+Caching the two for five minutes was enough to serve a 0.5.0 descriptor beside
+a 0.6.0 jar for a few minutes after a release — a `MIDlet-Jar-Size` of 144276
+against a jar of 150291. That is the silent install failure described above,
+manufactured by the cache rather than by a mistake in the build.
+
+Both are served `no-store` now. The descriptor is 240 bytes and the jar is
+downloaded once per install, so caching bought nothing and cost exactly that.
+
 ## What is deployed
 
 - The artifacts are attached to a GitHub release.
