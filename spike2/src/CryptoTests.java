@@ -1,4 +1,5 @@
 import berryssh.crypto.ChaCha20;
+import berryssh.crypto.EntropyPool;
 import berryssh.crypto.Poly1305;
 import berryssh.crypto.Ed25519;
 import berryssh.crypto.SHA256;
@@ -25,6 +26,7 @@ public class CryptoTests {
         x25519Vectors();
         sha512Vectors();
         ed25519Vectors();
+        entropyPoolVectors();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -274,6 +276,114 @@ public class CryptoTests {
     private static void writeLong(byte[] b, int off, long v) {
         for (int i = 0; i < 8; i++) {
             b[off + i] = (byte) (v >>> (8 * i));
+        }
+    }
+
+    /**
+     * The DRBG, against vectors computed independently in Python rather than
+     * against itself. The entropy estimate behind it is a judgement and cannot
+     * be tested; the construction that consumes it can.
+     */
+    private static void entropyPoolVectors() {
+        byte[] seed = new byte[32];
+        for (int i = 0; i < 32; i++) {
+            seed[i] = (byte) i;
+        }
+
+        check("DRBG from a stored seed",
+            new EntropyPool(seed).nextBytes(32),
+            "e106ca62126029d91ef7be33ccf0110a724e9b867ed0e7396098478194fe828c");
+
+        check("DRBG second block within one call",
+            tail(new EntropyPool(seed).nextBytes(64), 32),
+            "c2b2111d253dbb833506c9304714552f99769ca3df6d8005556d8e492c3fbb2c");
+
+        // A separate call must not continue where the last one stopped: the
+        // finalising ratchet moves the state on, which is what stops a
+        // recovered pool from reproducing bytes already handed out.
+        EntropyPool sequential = new EntropyPool(seed);
+        sequential.nextBytes(32);
+        check("DRBG ratchets between calls, not just within one",
+            sequential.nextBytes(32),
+            "c7d98b8dff6e52d5d2c7b077e88072e571a5d42e12cc0132ba194b07ba35148a");
+
+        checkTrue("DRBG diverges for a different seed",
+            !toHex(new EntropyPool(seed).nextBytes(32))
+                .equals(toHex(new EntropyPool(new byte[32]).nextBytes(32))));
+
+        boolean lengthsCorrect = true;
+        int[] lengths = { 1, 16, 31, 32, 33, 64, 100 };
+        for (int i = 0; i < lengths.length; i++) {
+            if (new EntropyPool(seed).nextBytes(lengths[i]).length != lengths[i]) {
+                lengthsCorrect = false;
+            }
+        }
+        checkTrue("DRBG returns the length asked for, across block boundaries", lengthsCorrect);
+
+        // The gate is the point of the class: weak bytes returned quietly would
+        // never be noticed, so an under-seeded pool must fail loudly instead.
+        EntropyPool cold = new EntropyPool();
+        checkTrue("a fresh pool is not seeded", !cold.isSeeded() && cold.seededBits() == 0);
+        boolean refused = false;
+        try {
+            cold.nextBytes(32);
+        } catch (IllegalStateException e) {
+            refused = true;
+        }
+        checkTrue("an under-seeded pool refuses to generate", refused);
+
+        // Uncredited samples must not open the gate, however many arrive.
+        EntropyPool guessable = new EntropyPool();
+        for (int i = 0; i < 100; i++) {
+            guessable.addPlatformState();
+        }
+        checkTrue("platform state alone does not seed the pool", !guessable.isSeeded());
+
+        EntropyPool harvested = new EntropyPool();
+        harvested.seed();
+        checkTrue("seed() reaches the requirement and then generates",
+            harvested.isSeeded()
+                && harvested.seededBits() == EntropyPool.REQUIRED_BITS
+                && harvested.nextBytes(32).length == 32);
+
+        // Not a proof of randomness — a check that the output is not degenerate,
+        // which is what a wiring mistake in the DRBG would actually look like.
+        byte[] bulk = new EntropyPool(seed).nextBytes(8192);
+        boolean[] seen = new boolean[256];
+        int ones = 0;
+        for (int i = 0; i < bulk.length; i++) {
+            int v = bulk[i] & 0xff;
+            seen[v] = true;
+            for (int bit = 0; bit < 8; bit++) {
+                if ((v & (1 << bit)) != 0) {
+                    ones++;
+                }
+            }
+        }
+        boolean allSeen = true;
+        for (int i = 0; i < 256; i++) {
+            if (!seen[i]) {
+                allSeen = false;
+            }
+        }
+        int totalBits = bulk.length * 8;
+        checkTrue("DRBG output covers every byte value and is bit-balanced",
+            allSeen && Math.abs(ones - totalBits / 2) < totalBits / 40);
+    }
+
+    private static byte[] tail(byte[] b, int n) {
+        byte[] out = new byte[n];
+        System.arraycopy(b, b.length - n, out, 0, n);
+        return out;
+    }
+
+    private static void checkTrue(String name, boolean condition) {
+        if (condition) {
+            passed++;
+            System.out.println("  PASS  " + name);
+        } else {
+            failed++;
+            System.out.println("  FAIL  " + name);
         }
     }
 
