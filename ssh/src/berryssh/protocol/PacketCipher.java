@@ -2,6 +2,7 @@ package berryssh.protocol;
 
 import java.io.IOException;
 
+import berryssh.crypto.Bytes;
 import berryssh.crypto.ChaCha20;
 import berryssh.crypto.Poly1305;
 
@@ -109,7 +110,7 @@ public final class PacketCipher {
         System.arraycopy(encryptedBody, 0, authenticated, LENGTH_FIELD_LENGTH, encryptedBody.length);
 
         byte[] expected = authenticate(nonce, authenticated, authenticated.length);
-        if (!equalsConstantTime(expected, tag)) {
+        if (!Bytes.equal(expected, tag)) {
             throw new SshException("packet authentication failed");
         }
 
@@ -129,6 +130,9 @@ public final class PacketCipher {
         return mac.finish();
     }
 
+    // The tag comparison lives in Bytes, with the other three that used to be
+    // scattered. See the note there on why there is only one of them.
+
     /**
      * The nonce is the sequence number, which is why a packet cannot be
      * replayed or reordered: its number is part of what authenticates it.
@@ -143,19 +147,4 @@ public final class PacketCipher {
         return nonce;
     }
 
-    /**
-     * Compared without an early exit. A comparison that stops at the first
-     * wrong byte tells an attacker how much of a forged tag was right, which is
-     * enough to build the rest of it a byte at a time.
-     */
-    private static boolean equalsConstantTime(byte[] a, byte[] b) {
-        if (a.length != b.length) {
-            return false;
-        }
-        int difference = 0;
-        for (int i = 0; i < a.length; i++) {
-            difference |= a[i] ^ b[i];
-        }
-        return difference == 0;
-    }
 }

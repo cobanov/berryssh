@@ -1,3 +1,4 @@
+import berryssh.crypto.Bytes;
 import berryssh.crypto.ChaCha20;
 import berryssh.crypto.EntropyPool;
 import berryssh.crypto.Hmac;
@@ -116,13 +117,18 @@ public class CryptoTests {
                     ascii("x")))));
 
         checkTrue("tags that match compare equal",
-            Hmac.equal(Hmac.compute(ascii("k"), ascii("m")),
+            Bytes.equal(Hmac.compute(ascii("k"), ascii("m")),
                 Hmac.compute(ascii("k"), ascii("m"))));
         checkTrue("a tag under a different key does not",
-            !Hmac.equal(Hmac.compute(ascii("k"), ascii("m")),
+            !Bytes.equal(Hmac.compute(ascii("k"), ascii("m")),
                 Hmac.compute(ascii("K"), ascii("m"))));
-        checkTrue("tags of different lengths do not",
-            !Hmac.equal(new byte[32], new byte[31]));
+        checkTrue("arrays of different lengths do not",
+            !Bytes.equal(new byte[32], new byte[31]));
+        checkTrue("a null is not equal to anything, including a null",
+            !Bytes.equal(null, new byte[0]) && !Bytes.equal(new byte[0], null)
+                && !Bytes.equal(null, null));
+        checkTrue("two empty arrays are equal",
+            Bytes.equal(new byte[0], new byte[0]));
     }
 
     private static byte[] repeat(byte value, int count) {

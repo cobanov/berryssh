@@ -55,22 +55,9 @@ public final class Hmac {
         return hash.digest();
     }
 
-    /**
-     * Compares two tags without letting the time taken say where they differ.
-     *
-     * The client has no secret to leak by comparing carelessly — it is the
-     * bridge that must not turn a wrong key into a guessing game — but the
-     * routine belongs next to the primitive, and the client uses it too so
-     * there is only one comparison to get right.
-     */
-    public static boolean equal(byte[] a, byte[] b) {
-        if (a.length != b.length) {
-            return false;
-        }
-        int difference = 0;
-        for (int i = 0; i < a.length; i++) {
-            difference |= a[i] ^ b[i];
-        }
-        return difference == 0;
-    }
+    // A tag comparison used to live here, on the argument that it belonged
+    // next to the primitive. Nothing ever called it: the client proves a key
+    // by producing a tag, and it is the bridge — which is Python — that has to
+    // compare one. Bytes.equal is where the comparison the client does need
+    // lives now.
 }
