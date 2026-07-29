@@ -8,11 +8,14 @@ import javax.microedition.io.Connector;
 import javax.microedition.io.SocketConnection;
 import javax.microedition.lcdui.Alert;
 import javax.microedition.lcdui.AlertType;
+import javax.microedition.lcdui.Choice;
+import javax.microedition.lcdui.ChoiceGroup;
 import javax.microedition.lcdui.Command;
 import javax.microedition.lcdui.CommandListener;
 import javax.microedition.lcdui.Display;
 import javax.microedition.lcdui.Displayable;
 import javax.microedition.lcdui.Form;
+import javax.microedition.lcdui.List;
 import javax.microedition.lcdui.TextField;
 import javax.microedition.midlet.MIDlet;
 
@@ -32,6 +35,9 @@ import berryssh.terminal.VT320;
  * Everything below this class is plain MIDP and CLDC and touches no RIM API,
  * which is the whole point: code that never reaches a protected API needs no
  * BlackBerry signature, and the authority that issued those no longer exists.
+ * That also rules out BlackBerry's own UI framework — these are MIDP screens,
+ * which the device draws in its own theme but which are not, and cannot be,
+ * the native widgets.
  *
  * Written for -source 1.3: no generics, no enhanced for, no StringBuilder.
  */
@@ -41,10 +47,27 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     private static final int CELL_WIDTH = 8;
     private static final int CELL_HEIGHT = 14;
 
-    private final Command connect = new Command("Connect", Command.OK, 1);
-    private final Command quit = new Command("Quit", Command.EXIT, 2);
+    private static final String NEW_CONNECTION = "New connection...";
+
+    // The connection list
+    private final Command connect = new Command("Connect", Command.ITEM, 1);
+    private final Command newConnection = new Command("New", Command.SCREEN, 2);
+    private final Command edit = new Command("Edit", Command.SCREEN, 3);
+    private final Command delete = new Command("Delete", Command.SCREEN, 4);
+    private final Command quit = new Command("Quit", Command.EXIT, 9);
+
+    // The editor
+    private final Command save = new Command("Save", Command.OK, 1);
+    private final Command back = new Command("Back", Command.BACK, 2);
+
+    // The password prompt
+    private final Command go = new Command("Connect", Command.OK, 1);
+
+    // The host key prompt
     private final Command acceptKey = new Command("Accept", Command.OK, 1);
     private final Command rejectKey = new Command("Reject", Command.CANCEL, 2);
+
+    // The terminal
     private final Command control = new Command("Ctrl", Command.SCREEN, 1);
     private final Command escape = new Command("Esc", Command.SCREEN, 2);
     private final Command keys = new Command("Keys", Command.SCREEN, 3);
@@ -53,18 +76,29 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     private final Command disconnect = new Command("Disconnect", Command.STOP, 6);
 
     private Display display;
-    private Form setup;
+    private List connections;
+    private Profile[] profiles = new Profile[0];
+
+    private Form editor;
+    private TextField nameField;
     private TextField hostField;
     private TextField portField;
     private TextField userField;
     private TextField passwordField;
+    private ChoiceGroup savePasswordChoice;
+    private String editingName;
+
+    private TextField promptPassword;
+    private Profile pendingProfile;
 
     private TerminalCanvas canvas;
     private Keyboard keyboard;
     private VT320 terminal;
+    private Profile current;
 
     private final EntropyPool random = new EntropyPool();
     private final RecordStoreHostKeys hostKeys = new RecordStoreHostKeys();
+    private final RecordStoreProfiles store = new RecordStoreProfiles();
 
     private SocketConnection socket;
     private Channel channel;
@@ -72,11 +106,9 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     private boolean fullScreenOn;
 
     /**
-     * How the session thread asks the user something and waits for the answer.
-     *
-     * The prompt has to be raised on one thread and answered on another, and
-     * the connection cannot proceed until it is — which is the whole point of a
-     * confirmation.
+     * How the session thread asks the user something and waits for an answer.
+     * The question is raised on one thread and answered on another, and the
+     * connection cannot proceed until it is — which is what a confirmation is.
      */
     private final Object promptLock = new Object();
     private Boolean promptAnswer;
@@ -87,33 +119,24 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         }
         display = Display.getDisplay(this);
 
-        // Seeding costs about a tenth of a second and needs doing before any
-        // key material is asked for. Doing it here rather than at connect time
-        // spends it while the user is still typing a hostname.
+        // Seeding costs about a tenth of a second and has to happen before any
+        // key material is asked for. Doing it here spends it while the user is
+        // still choosing a connection.
         new Thread(new Runnable() {
             public void run() {
                 random.seed();
             }
         }).start();
 
-        setup = new Form("berryssh");
-        // URL and EMAILADDR both put the device into an input mode that does
-        // not capitalise the first letter. TextField.ANY does, which made
-        // every username start with a capital and need correcting by hand.
-        hostField = new TextField("Host", "", 64,
-            TextField.URL | TextField.NON_PREDICTIVE);
-        portField = new TextField("Port", "22", 5, TextField.NUMERIC);
-        userField = new TextField("User", "", 32,
-            TextField.EMAILADDR | TextField.NON_PREDICTIVE);
-        passwordField = new TextField("Password", "", 64, TextField.PASSWORD);
-        setup.append(hostField);
-        setup.append(portField);
-        setup.append(userField);
-        setup.append(passwordField);
-        setup.addCommand(connect);
-        setup.addCommand(quit);
-        setup.setCommandListener(this);
-        display.setCurrent(setup);
+        connections = new List("berryssh", Choice.IMPLICIT);
+        connections.addCommand(connect);
+        connections.addCommand(newConnection);
+        connections.addCommand(edit);
+        connections.addCommand(delete);
+        connections.addCommand(quit);
+        connections.setCommandListener(this);
+        refreshConnections();
+        display.setCurrent(connections);
     }
 
     protected void pauseApp() {
@@ -123,16 +146,97 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         shutdown();
     }
 
+    private void refreshConnections() {
+        try {
+            profiles = store.list();
+        } catch (IOException e) {
+            profiles = new Profile[0];
+        }
+        connections.deleteAll();
+        for (int i = 0; i < profiles.length; i++) {
+            connections.append(profiles[i].label(), null);
+        }
+        connections.append(NEW_CONNECTION, null);
+    }
+
+    /** The profile the list is pointing at, or null for the New entry. */
+    private Profile selected() {
+        int index = connections.getSelectedIndex();
+        if (index < 0 || index >= profiles.length) {
+            return null;
+        }
+        return profiles[index];
+    }
+
     public void commandAction(Command command, Displayable from) {
         if (command == quit) {
             shutdown();
             notifyDestroyed();
             return;
         }
-        if (command == connect) {
-            startSession();
+
+        if (from == connections) {
+            if (command == List.SELECT_COMMAND || command == connect) {
+                Profile profile = selected();
+                if (profile == null) {
+                    showEditor(null);
+                } else {
+                    begin(profile);
+                }
+                return;
+            }
+            if (command == newConnection) {
+                showEditor(null);
+                return;
+            }
+            if (command == edit) {
+                showEditor(selected());
+                return;
+            }
+            if (command == delete) {
+                Profile profile = selected();
+                if (profile != null) {
+                    try {
+                        store.delete(profile.name());
+                    } catch (IOException e) {
+                        show("Could not delete: " + e.getMessage(),
+                            AlertType.ERROR, connections);
+                    }
+                    refreshConnections();
+                }
+                return;
+            }
+        }
+
+        if (command == save) {
+            saveEditor();
             return;
         }
+        if (command == back) {
+            pendingProfile = null;
+            refreshConnections();
+            display.setCurrent(connections);
+            return;
+        }
+        if (command == go) {
+            Profile p = pendingProfile;
+            pendingProfile = null;
+            if (p != null) {
+                start(new Profile(p.name(), p.host(), p.port(), p.user(),
+                    promptPassword.getString(), false));
+            }
+            return;
+        }
+
+        if (command == acceptKey || command == rejectKey) {
+            synchronized (promptLock) {
+                promptAnswer = (command == acceptKey) ? Boolean.TRUE : Boolean.FALSE;
+                promptLock.notifyAll();
+            }
+            display.setCurrent(canvas);
+            return;
+        }
+
         // The keyboard only exists once a session has attached one, and these
         // commands are in the menu from the moment the screen appears.
         if (command == control) {
@@ -160,39 +264,105 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         }
         if (command == reconnect) {
             shutdown();
-            startSession();
-            return;
-        }
-        if (command == acceptKey || command == rejectKey) {
-            synchronized (promptLock) {
-                promptAnswer = (command == acceptKey) ? Boolean.TRUE : Boolean.FALSE;
-                promptLock.notifyAll();
+            if (current != null) {
+                start(current);
             }
-            display.setCurrent(canvas);
             return;
         }
         if (command == disconnect) {
             shutdown();
-            display.setCurrent(setup);
+            refreshConnections();
+            display.setCurrent(connections);
         }
     }
 
-    private void startSession() {
-        final String host = hostField.getString().trim();
-        final int port = parsePort(portField.getString());
-        final String user = userField.getString().trim();
-        final String password = passwordField.getString();
+    private void showEditor(Profile profile) {
+        editingName = profile == null ? null : profile.name();
+        editor = new Form(profile == null ? "New connection" : "Edit connection");
 
+        nameField = new TextField("Name", profile == null ? "" : profile.name(),
+            32, TextField.ANY);
+        // URL and EMAILADDR put the device into an input mode that does not
+        // capitalise the first letter. TextField.ANY does, which made every
+        // host and user name start with a capital and need correcting by hand
+        // on a keyboard where that is several presses.
+        hostField = new TextField("Host", profile == null ? "" : profile.host(),
+            64, TextField.URL | TextField.NON_PREDICTIVE);
+        portField = new TextField("Port", profile == null ? "22" : "" + profile.port(),
+            5, TextField.NUMERIC);
+        userField = new TextField("User", profile == null ? "" : profile.user(),
+            32, TextField.EMAILADDR | TextField.NON_PREDICTIVE);
+        passwordField = new TextField("Password",
+            profile == null ? "" : profile.password(), 64, TextField.PASSWORD);
+        savePasswordChoice = new ChoiceGroup("", Choice.MULTIPLE,
+            new String[] { "Save password (not encrypted)" }, null);
+        savePasswordChoice.setSelectedIndex(0, profile != null && profile.savePassword());
+
+        editor.append(nameField);
+        editor.append(hostField);
+        editor.append(portField);
+        editor.append(userField);
+        editor.append(passwordField);
+        editor.append(savePasswordChoice);
+        editor.addCommand(save);
+        editor.addCommand(back);
+        editor.setCommandListener(this);
+        display.setCurrent(editor);
+    }
+
+    private void saveEditor() {
+        String host = hostField.getString().trim();
+        String user = userField.getString().trim();
         if (host.length() == 0 || user.length() == 0) {
-            show("A host and a user are needed.", AlertType.WARNING, setup);
+            show("A host and a user are needed.", AlertType.WARNING, editor);
             return;
         }
+        String name = nameField.getString().trim();
+        if (name.length() == 0) {
+            name = host;
+        }
+
+        Profile profile = new Profile(name, host, parsePort(portField.getString()),
+            user, passwordField.getString(), savePasswordChoice.isSelected(0));
+        try {
+            // Renaming replaces rather than duplicating.
+            if (editingName != null && !editingName.equals(name)) {
+                store.delete(editingName);
+            }
+            store.save(profile);
+        } catch (IOException e) {
+            show("Could not save: " + e.getMessage(), AlertType.ERROR, editor);
+            return;
+        }
+        refreshConnections();
+        display.setCurrent(connections);
+    }
+
+    /** Connects, asking for the password first when none was saved. */
+    private void begin(Profile profile) {
+        if (profile.savePassword() && profile.password().length() > 0) {
+            start(profile);
+            return;
+        }
+        pendingProfile = profile;
+        Form prompt = new Form(profile.user() + "@" + profile.host());
+        promptPassword = new TextField("Password", "", 64, TextField.PASSWORD);
+        prompt.append(promptPassword);
+        prompt.addCommand(go);
+        prompt.addCommand(back);
+        prompt.setCommandListener(this);
+        display.setCurrent(prompt);
+    }
+
+    private void start(final Profile profile) {
+        current = profile;
 
         BitmapFont font;
         try {
             font = BitmapFont.load(FONT, CELL_WIDTH, CELL_HEIGHT);
         } catch (IOException e) {
-            show("The font atlas is missing: " + e.getMessage(), AlertType.ERROR, setup);
+            show("The font atlas is missing: " + e.getMessage(),
+                AlertType.ERROR, connections);
             return;
         }
 
@@ -203,12 +373,11 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         canvas.addCommand(fullScreen);
         canvas.addCommand(reconnect);
         canvas.addCommand(disconnect);
-        // Quit belongs on this screen too. Reaching it only from the setup
-        // form means a session that will not disconnect cleanly is a session
-        // you cannot leave.
+        // Quit belongs on this screen too. Reaching it only from the list means
+        // a session that will not disconnect cleanly is one you cannot leave.
         canvas.addCommand(quit);
         canvas.setCommandListener(this);
-        canvas.setStatus("connecting to " + host + "...");
+        canvas.setStatus("connecting to " + profile.host() + "...");
         display.setCurrent(canvas);
 
         // Networking must not run on the event thread: on this platform the
@@ -217,12 +386,14 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         running = true;
         new Thread(new Runnable() {
             public void run() {
-                runSession(host, port, user, password);
+                runSession(profile);
             }
         }).start();
     }
 
-    private void runSession(String host, int port, String user, String password) {
+    private void runSession(Profile profile) {
+        String host = profile.host();
+        int port = profile.port();
         try {
             random.seed();
 
@@ -254,10 +425,10 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
                 KnownHosts.accept(hostKeys, host, port, key);
             }
 
-            UserAuth auth = new UserAuth(connection, user);
+            UserAuth auth = new UserAuth(connection, profile.user());
             auth.begin();
             auth.queryMethods();
-            if (!auth.password(password).succeeded()) {
+            if (!auth.password(profile.password()).succeeded()) {
                 fail("Authentication failed.");
                 return;
             }
@@ -285,7 +456,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             };
             keyboard = new Keyboard(terminal);
             canvas.attach(terminal, keyboard);
-            canvas.setStatus(user + "@" + host + "  " + columns + "x" + rows);
+            canvas.setStatus(profile.user() + "@" + host + "  " + columns + "x" + rows);
 
             session.requestPty("xterm", columns, rows);
             session.requestShell();
@@ -296,8 +467,6 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
                 if (n < 0) {
                     break;
                 }
-                // The device's default encoding is ISO8859_1, so the decode is
-                // ours to do. See Utf8.
                 // The painter reads this buffer from the event thread while
                 // this thread writes it. VT320 publishes a mutex for exactly
                 // that, and using it is the difference between a redraw during
@@ -323,11 +492,6 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
      * that route is gone — BIS was switched off, and MDS needs an enterprise
      * server — so the connection has to say Wi-Fi explicitly. The suffixes are
      * URL parameters rather than an API, so they cost nothing in signing terms.
-     *
-     * They are tried in order rather than assumed, because which one a given
-     * OS 7 build accepts has not been established on the hardware here. The one
-     * that works is reported on the status line, so the first real connection
-     * also settles the question.
      */
     private SocketConnection openSocket(String host, int port) throws IOException {
         String address = "socket://" + host + ":" + port;
@@ -353,13 +517,6 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             + " (last error: " + (last == null ? "none" : last.getMessage()) + ")");
     }
 
-    /**
-     * Reports a fault, unless we caused it.
-     *
-     * Disconnecting closes the socket under a reader that is blocked on it, so
-     * the read fails by design. Showing that as an error would put a warning in
-     * front of a user who just chose to leave.
-     */
     /**
      * Puts a question to the user and blocks until it is answered.
      *
@@ -387,12 +544,19 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         }
     }
 
+    /**
+     * Reports a fault, unless we caused it.
+     *
+     * Disconnecting closes the socket under a reader that is blocked on it, so
+     * the read fails by design. Showing that as an error would put a warning in
+     * front of a user who just chose to leave.
+     */
     private void fail(final String message) {
         if (!running) {
             return;
         }
         canvas.setStatus("");
-        show(message, AlertType.ERROR, setup);
+        show(message, AlertType.ERROR, connections);
     }
 
     private void show(String message, AlertType type, Displayable next) {
@@ -414,7 +578,9 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         }
         int columns = canvas.columns();
         int rows = canvas.rows();
-        terminal.setScreenSize(columns, rows, true);
+        synchronized (terminal.getTermBufferMutex()) {
+            terminal.setScreenSize(columns, rows, true);
+        }
         try {
             channel.windowChange(columns, rows);
         } catch (IOException e) {

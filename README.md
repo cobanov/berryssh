@@ -94,8 +94,9 @@ against vectors computed outside it. 49 in total.
 **Transport**: RFC 4251 §5 for the wire types, RFC 4253 §6 for the packet
 framing and §7.1 for algorithm negotiation, RFC 8731 §3 for the exchange hash
 and RFC 4253 §7.2 for key derivation, plus base64, host key parsing, the
-version exchange, the chacha20-poly1305 packet layer, UTF-8, host key trust
-and the paths that have to reject malformed input. 99 in total. They run under a Turkish default locale, which is the device's own and
+version exchange, the chacha20-poly1305 packet layer, UTF-8, host key trust,
+saved connections and the paths that have to reject malformed input. 106 in
+total. They run under a Turkish default locale, which is the device's own and
 the setting most likely to break protocol code without raising an error
 anywhere.
 
@@ -156,6 +157,7 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
 - [x] VT320 terminal emulation, and a bitmap font renderer
 - [x] A MIDlet that connects, authenticates and runs a shell
 - [x] Runs on a Bold 9790: connects, authenticates, opens a shell
+- [x] Saved connections, host key confirmation, and a transport two threads can share
 - [ ] Keyboard mapping confirmed against the hardware's real key codes
 
 ## Prior art
