@@ -1,4 +1,5 @@
 import berryssh.crypto.EntropyPool;
+import berryssh.protocol.Connection;
 import berryssh.protocol.HostKey;
 import berryssh.protocol.KexInit;
 import berryssh.protocol.KeyExchange;
@@ -41,6 +42,7 @@ public class ServerTests {
         System.out.println("  ..    against " + host + ":" + port);
         negotiatesWithRealServer();
         exchangesKeysWithRealServer();
+        encryptsWithRealServer();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -146,6 +148,45 @@ public class ServerTests {
                 keyOut.length == 64 && keyIn.length == 64 && !sameBytes(keyOut, keyIn));
         } finally {
             h.socket.close();
+        }
+    }
+
+    /**
+     * The full handshake through NEWKEYS, and then a packet in each direction
+     * under the negotiated cipher.
+     *
+     * A service request is the smallest thing that proves it: the server has to
+     * authenticate and decrypt what we sent, and we have to authenticate and
+     * decrypt its answer. Both directions and both keys, in one exchange. There
+     * is no way for this to pass with the key halves swapped or the padding
+     * rule wrong.
+     */
+    private static void encryptsWithRealServer() throws Exception {
+        Socket socket = new Socket(host, port);
+        try {
+            socket.setSoTimeout(15000);
+            EntropyPool random = new EntropyPool();
+            random.seed();
+            Connection connection = new Connection(
+                socket.getInputStream(), socket.getOutputStream(), random);
+
+            HostKey key = connection.handshake();
+            checkTrue("the handshake completes through NEWKEYS in both directions",
+                key != null && connection.sessionId() != null
+                    && connection.sessionId().length == 32);
+
+            connection.requestService("ssh-userauth");
+            checkTrue("an encrypted service request is accepted and its reply decrypts",
+                connection.transport().sendSequence() > 0
+                    && connection.transport().receiveSequence() > 0);
+
+            // Sequence numbers have to agree with the server's or the nonces
+            // diverge and nothing decrypts from that point on. Getting several
+            // packets past NEWKEYS is that agreement holding.
+            System.out.println("        " + connection.transport().sendSequence()
+                + " packets sent, " + connection.transport().receiveSequence() + " received");
+        } finally {
+            socket.close();
         }
     }
 

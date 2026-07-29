@@ -94,8 +94,8 @@ against vectors computed outside it. 38 in total.
 **Transport**: RFC 4251 §5 for the wire types, RFC 4253 §6 for the packet
 framing and §7.1 for algorithm negotiation, RFC 8731 §3 for the exchange hash
 and RFC 4253 §7.2 for key derivation, plus base64, host key parsing, the
-version exchange and the paths that have to reject malformed input. 74 in
-total. They run under a Turkish default locale, which is the device's own and
+version exchange, the chacha20-poly1305 packet layer and the paths that have
+to reject malformed input. 85 in total. They run under a Turkish default locale, which is the device's own and
 the setting most likely to break protocol code without raising an error
 anywhere.
 
@@ -148,7 +148,7 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
 - [x] A random source for key material
 - [x] KEXINIT algorithm negotiation
 - [x] `curve25519-sha256` key exchange, host key check and key derivation
-- [ ] `chacha20-poly1305@openssh.com` packet layer
+- [x] `chacha20-poly1305@openssh.com` packet layer, and an encrypted handshake
 - [ ] User authentication
 - [ ] Channels, `pty-req`, shell
 - [ ] Terminal emulation and UI

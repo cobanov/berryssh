@@ -3,6 +3,7 @@ import berryssh.protocol.Base64;
 import berryssh.protocol.HostKey;
 import berryssh.protocol.KexInit;
 import berryssh.protocol.KeyExchange;
+import berryssh.protocol.PacketCipher;
 import berryssh.protocol.Negotiation;
 import berryssh.protocol.SshException;
 import berryssh.protocol.Transport;
@@ -52,6 +53,8 @@ public class TransportTests {
         base64Vectors();
         hostKeyVectors();
         exchangeHashVectors();
+        packetCipherVectors();
+        encryptedFraming();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -542,6 +545,122 @@ public class TransportTests {
         check("derived key A, 16 bytes from one hash",
             KeyExchange.deriveKey(shared, h, 'A', h, 16),
             "132bce258cdfdb26edd5ce05dc891bc3");
+    }
+
+    /**
+     * chacha20-poly1305@openssh.com against a reference written from
+     * PROTOCOL.chacha20poly1305 rather than from this implementation. The two
+     * key halves are the detail worth pinning: swapping them gives a cipher
+     * that is perfectly self-consistent and cannot talk to anything.
+     */
+    private static void packetCipherVectors() {
+        byte[] key = counting(0, 64);
+        byte[] body = hex("0baaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000102030405060708090a");
+
+        check("sealed packet: encrypted length, body and tag",
+            new PacketCipher(key).seal(3, body),
+            "fb1a92aa"
+                + "8befb61198e00edb22e556a0114d3ce9cd76e66d6add5e45080e036ea6bd88c8"
+                + "373ac47bfddf5152b56c3baaae5aa723");
+
+        checkTrue("the length field decrypts on its own, before anything is authenticated",
+            new PacketCipher(key).peekLength(3, hex("fb1a92aa")) == 32);
+
+        // The sequence number is the nonce, which is what makes a packet
+        // impossible to replay or reorder: its number authenticates it.
+        checkTrue("a different sequence number produces a different packet",
+            !toHex(new PacketCipher(key).seal(4, body))
+                .equals(toHex(new PacketCipher(key).seal(3, body))));
+
+        try {
+            PacketCipher cipher = new PacketCipher(key);
+            byte[] wire = cipher.seal(7, body);
+            byte[] encryptedLength = slice(wire, 0, 4);
+            byte[] encryptedBody = slice(wire, 4, wire.length - 20);
+            byte[] tag = slice(wire, wire.length - 16, 16);
+            checkTrue("a sealed packet opens back to the same body",
+                sameBytes(body, cipher.open(7, encryptedLength, encryptedBody, tag)));
+
+            checkRejected("a packet opened at the wrong sequence number is refused",
+                () -> cipher.open(8, encryptedLength, encryptedBody, tag));
+            checkRejected("a tampered tag is refused",
+                () -> cipher.open(7, encryptedLength, encryptedBody, flip(tag, 0)));
+            checkRejected("a tampered body is refused",
+                () -> cipher.open(7, encryptedLength, flip(encryptedBody, 5), tag));
+            // The tag covers the length field too, so tampering with it is
+            // caught even though it is encrypted under a separate key.
+            checkRejected("a tampered length field is refused",
+                () -> cipher.open(7, flip(encryptedLength, 0), encryptedBody, tag));
+        } catch (IOException e) {
+            fail("packet cipher round trip threw " + e);
+        }
+    }
+
+    /**
+     * The framing changes once the AEAD is in play: RFC 4253 counts the length
+     * field towards the block multiple, but chacha20-poly1305 encrypts it
+     * separately, so it is excluded. Getting this wrong produces packets a
+     * server rejects as corrupt without saying that padding is the objection.
+     */
+    private static void encryptedFraming() {
+        byte[] key = counting(64, 64);
+        boolean allRoundTripped = true;
+        boolean allAligned = true;
+
+        for (int length = 0; length <= 40; length++) {
+            byte[] payload = counting(1, length);
+            try {
+                ByteArrayOutputStream sink = new ByteArrayOutputStream();
+                Transport writer = new Transport(new ByteArrayInputStream(new byte[0]), sink);
+                writer.encryptOutgoing(new PacketCipher(key));
+                writer.writePacket(payload);
+                byte[] wire = sink.toByteArray();
+
+                // The encrypted run between the length field and the tag is
+                // what has to be a whole number of blocks.
+                int encrypted = wire.length - 4 - PacketCipher.TAG_LENGTH;
+                if (encrypted % 8 != 0 || wire.length < 16 + PacketCipher.TAG_LENGTH) {
+                    allAligned = false;
+                }
+
+                Transport reader = new Transport(new ByteArrayInputStream(wire),
+                                                 new ByteArrayOutputStream());
+                reader.decryptIncoming(new PacketCipher(key));
+                if (!sameBytes(payload, reader.readPacket())) {
+                    allRoundTripped = false;
+                }
+            } catch (IOException e) {
+                fail("encrypted framing of a " + length + "-byte payload threw " + e);
+                return;
+            }
+        }
+
+        checkTrue("encrypted packets of every payload length 0..40 are block aligned", allAligned);
+        checkTrue("encrypted packets of every payload length 0..40 round trip", allRoundTripped);
+
+        // A cipher enabled on one side only must fail rather than produce
+        // plausible nonsense, which is what a mis-ordered NEWKEYS would do.
+        checkRejected("a plaintext reader refuses an encrypted packet", () -> {
+            ByteArrayOutputStream sink = new ByteArrayOutputStream();
+            Transport writer = new Transport(new ByteArrayInputStream(new byte[0]), sink);
+            writer.encryptOutgoing(new PacketCipher(key));
+            writer.writePacket(Ascii.toBytes("this should not be readable in the clear"));
+            new Transport(new ByteArrayInputStream(sink.toByteArray()),
+                          new ByteArrayOutputStream()).readPacket();
+        });
+    }
+
+    private static byte[] slice(byte[] b, int offset, int length) {
+        byte[] out = new byte[length];
+        System.arraycopy(b, offset, out, 0, length);
+        return out;
+    }
+
+    private static byte[] flip(byte[] b, int index) {
+        byte[] out = new byte[b.length];
+        System.arraycopy(b, 0, out, 0, b.length);
+        out[index] ^= 0x01;
+        return out;
     }
 
     private static byte[] counting(int from, int length) {
