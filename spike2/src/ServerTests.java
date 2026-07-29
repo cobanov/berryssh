@@ -1,4 +1,5 @@
 import berryssh.crypto.EntropyPool;
+import berryssh.protocol.Channel;
 import berryssh.protocol.Connection;
 import berryssh.protocol.HostKey;
 import berryssh.protocol.KexInit;
@@ -7,6 +8,7 @@ import berryssh.protocol.Message;
 import berryssh.protocol.Negotiation;
 import berryssh.protocol.Transport;
 import berryssh.protocol.UserAuth;
+import berryssh.protocol.Utf8;
 
 import java.io.IOException;
 import java.net.Socket;
@@ -51,6 +53,7 @@ public class ServerTests {
         exchangesKeysWithRealServer();
         encryptsWithRealServer();
         authenticatesWithRealServer();
+        runsAShellOnRealServer();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -251,6 +254,68 @@ public class ServerTests {
 
             UserAuth.Result right = auth.password(password);
             checkTrue("the right password is accepted", right.succeeded());
+        } finally {
+            socket.close();
+        }
+    }
+
+    /**
+     * The whole thing: handshake, authenticate, take a pty, run a shell, and
+     * read back what it printed.
+     *
+     * This is the test the project is for. Everything below it has to be right
+     * simultaneously — a wrong exchange hash, a swapped cipher key, a padding
+     * rule off by eight, a mis-encoded password or a forgotten window update
+     * each stop it, and none of them can be compensated for by another.
+     */
+    private static void runsAShellOnRealServer() throws Exception {
+        Socket socket = new Socket(host, port);
+        try {
+            socket.setSoTimeout(20000);
+            EntropyPool random = new EntropyPool();
+            random.seed();
+            Connection connection = new Connection(
+                socket.getInputStream(), socket.getOutputStream(), random);
+            connection.handshake();
+
+            UserAuth auth = new UserAuth(connection, user);
+            auth.begin();
+            auth.queryMethods();
+            checkTrue("authenticated for the shell test", auth.password(password).succeeded());
+
+            Channel channel = Channel.openSession(connection);
+            checkTrue("a session channel opens", channel != null);
+
+            // 60x25 is what an 8x14 bitmap cell gives on the device's 480x360
+            // canvas, so the server is told the size the terminal will be.
+            channel.requestPty("xterm", 60, 25);
+            channel.requestShell();
+            checkTrue("the server grants a pty and starts a shell", true);
+
+            channel.write(Utf8.encode("echo be''rryssh-works; stty size; exit\n"));
+
+            StringBuffer output = new StringBuffer();
+            byte[] buffer = new byte[4096];
+            for (;;) {
+                int n = channel.read(buffer, 0, buffer.length);
+                if (n < 0) {
+                    break;
+                }
+                output.append(Utf8.decode(buffer, 0, n));
+            }
+            String text = output.toString();
+
+            // Written split so the echoed command line cannot be mistaken for
+            // the shell's output: only the shell can produce it joined.
+            checkTrue("the shell runs a command and returns its output",
+                text.indexOf("berryssh-works") >= 0);
+
+            // The pty really carries the dimensions we asked for, rather than
+            // the request merely being accepted.
+            checkTrue("the pty is the 60x25 we asked for", text.indexOf("25 60") >= 0);
+
+            channel.close();
+            System.out.println("        shell exit status " + channel.exitStatus());
         } finally {
             socket.close();
         }

@@ -150,7 +150,7 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
 - [x] `curve25519-sha256` key exchange, host key check and key derivation
 - [x] `chacha20-poly1305@openssh.com` packet layer, and an encrypted handshake
 - [x] User authentication: `none`, `password`, `publickey` with Ed25519
-- [ ] Channels, `pty-req`, shell
+- [x] Channels, `pty-req`, shell — a working session against OpenSSH 9.2p1
 - [ ] Terminal emulation and UI
 
 ## Prior art
