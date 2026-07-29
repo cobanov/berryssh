@@ -109,6 +109,7 @@ convinces an OpenSSH server or it does not, so the other half of the
 verification talks to one:
 
 ```sh
+tools/rekey-server.sh             # a second server that rekeys every 64 KB
 spike2/against-server.sh          # defaults to the project's container
 ```
 

@@ -83,6 +83,8 @@ public final class Transport {
     private PacketCipher outgoing;
     private PacketCipher incoming;
 
+    private RekeyHandler rekeyHandler;
+
     private String clientVersion;
     private String serverVersion;
     private long sendSequence;
@@ -109,6 +111,33 @@ public final class Transport {
 
     public long receiveSequence() {
         return receiveSequence;
+    }
+
+    /**
+     * Runs a fresh key exchange when the server asks for one mid-session.
+     *
+     * Handled here for the same reason IGNORE and DEBUG are: a KEXINIT can
+     * arrive at any moment once the connection is up, and every state machine
+     * above this would otherwise have to know that.
+     */
+    public interface RekeyHandler {
+        void rekey(byte[] serverKexInit) throws IOException;
+    }
+
+    public void setRekeyHandler(RekeyHandler handler) {
+        this.rekeyHandler = handler;
+    }
+
+    /**
+     * The lock that serialises sending.
+     *
+     * Exposed so a rekey can hold it across the whole exchange. Between the two
+     * NEWKEYS the keys are changing, and a keystroke that slipped in would be
+     * encrypted under keys the server had already retired. Java monitors are
+     * reentrant, so writePacket still works for the thread holding it.
+     */
+    public Object sendLock() {
+        return sendLock;
     }
 
     /** Takes effect from the next packet we send. Call it straight after sending NEWKEYS. */
@@ -302,6 +331,13 @@ public final class Transport {
             }
             int type = payload[0] & 0xff;
             if (type == Message.IGNORE || type == Message.DEBUG) {
+                continue;
+            }
+            if (type == Message.KEXINIT && rekeyHandler != null) {
+                // OpenSSH asks for this after about a gigabyte or an hour.
+                // Before it was handled, an hour-old session died with a
+                // complaint about an unexpected message on a channel.
+                rekeyHandler.rekey(payload);
                 continue;
             }
             if (type == Message.DISCONNECT) {
