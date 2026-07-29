@@ -94,8 +94,8 @@ against vectors computed outside it. 49 in total.
 **Transport**: RFC 4251 §5 for the wire types, RFC 4253 §6 for the packet
 framing and §7.1 for algorithm negotiation, RFC 8731 §3 for the exchange hash
 and RFC 4253 §7.2 for key derivation, plus base64, host key parsing, the
-version exchange, the chacha20-poly1305 packet layer, UTF-8 and the paths
-that have to reject malformed input. 93 in total. They run under a Turkish default locale, which is the device's own and
+version exchange, the chacha20-poly1305 packet layer, UTF-8, host key trust
+and the paths that have to reject malformed input. 99 in total. They run under a Turkish default locale, which is the device's own and
 the setting most likely to break protocol code without raising an error
 anywhere.
 
@@ -151,6 +151,7 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
 - [x] `chacha20-poly1305@openssh.com` packet layer, and an encrypted handshake
 - [x] User authentication: `none`, `password`, `publickey` with Ed25519
 - [x] Channels, `pty-req`, shell — a working session against OpenSSH 9.2p1
+- [x] Host key trust, stored in RMS
 - [ ] Terminal emulation and UI
 
 ## Prior art
