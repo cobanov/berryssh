@@ -18,6 +18,7 @@ import javax.microedition.lcdui.TextField;
 import javax.microedition.midlet.MIDlet;
 
 import berryssh.crypto.EntropyPool;
+import berryssh.protocol.BridgeAuth;
 import berryssh.protocol.Channel;
 import berryssh.protocol.Connection;
 import berryssh.protocol.HostKey;
@@ -83,8 +84,15 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
 
     private static final String[] FIELDS = {
         "Name", "Host", "Port", "User", "Password", "Save password",
-        "Private key", "Terminal size", "WebSocket path"
+        "Private key", "Terminal size", "WebSocket path", "Bridge key",
+        "Bridge target"
     };
+
+    private static final int FIELD_SAVE_PASSWORD = 5;
+    private static final int FIELD_TERMINAL_SIZE = 7;
+    private static final int FIELD_WEBSOCKET_PATH = 8;
+    private static final int FIELD_BRIDGE_KEY = 9;
+    private static final int FIELD_BRIDGE_TARGET = 10;
 
     private Display display;
     private ListScreen connections;
@@ -101,7 +109,12 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     private String editKey = "";
     private int editFontSize;
     private String editWsPath = "";
+    private String editBridgeKey = "";
+    private String editBridgeTarget = "";
     private int editingField = -1;
+
+    private ListScreen targetPicker;
+    private String[] offeredTargets = new String[0];
 
     private TextBox entry;
     private Profile pendingProfile;
@@ -262,8 +275,13 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             Profile p = pendingProfile;
             pendingProfile = null;
             if (p != null) {
+                // Every field, not just the ones the password prompt is about.
+                // Dropping the WebSocket path here made a bridged connection
+                // that had no saved password quietly try a plain socket to the
+                // bridge instead, and fail as though the server were down.
                 start(new Profile(p.name(), p.host(), p.port(), p.user(),
-                    entry.getString(), false, p.privateKey(), p.fontSize()));
+                    entry.getString(), false, p.privateKey(), p.fontSize(),
+                    p.webSocketPath(), p.bridgeKey(), p.bridgeTarget()));
             }
             return;
         }
@@ -335,6 +353,8 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         editKey = profile == null ? "" : profile.privateKey();
         editFontSize = profile == null ? 0 : profile.fontSize();
         editWsPath = profile == null ? "" : profile.webSocketPath();
+        editBridgeKey = profile == null ? "" : profile.bridgeKey();
+        editBridgeTarget = profile == null ? "" : profile.bridgeTarget();
 
         if (editor == null) {
             editor = new ListScreen("Connection", new ListScreen.Listener() {
@@ -364,7 +384,12 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             editSavePassword ? "yes  (stored unencrypted)" : "no",
             editKey.length() > 0 ? "set" : "not set  (paste id_ed25519)",
             Profile.SIZE_LABELS[editFontSize],
-            editWsPath.length() > 0 ? editWsPath : "not used  (plain socket)"
+            editWsPath.length() > 0 ? editWsPath : "not used  (plain socket)",
+            // Shown as a state rather than a value, like the password: this one
+            // is not secret from the server, but it is what stops a stranger
+            // using the bridge, and a screen is a public place.
+            editBridgeKey.length() > 0 ? "set" : "not set  (bridge asks for none)",
+            editBridgeTarget.length() > 0 ? editBridgeTarget : "ask the bridge"
         };
         String[] names = new String[FIELDS.length];
         for (int i = 0; i < FIELDS.length; i++) {
@@ -376,23 +401,33 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     /**
      * Opens a field.
      *
-     * The two that are a choice rather than a value just change; the rest hand
-     * over to TextBox, which is the platform's own full-screen editor. It knows
-     * this keyboard, its input modes and its capitalisation rules, and
-     * reimplementing that on a canvas would be worse in every way that matters.
+     * Two are a choice rather than a value and just change. One asks the bridge
+     * what it will reach, when there is enough to ask with. The rest are typed.
      */
     private void editField(int index) {
-        if (index == 5) {
+        if (index == FIELD_SAVE_PASSWORD) {
             editSavePassword = !editSavePassword;
             refreshEditor();
             return;
         }
-        if (index == 7) {
+        if (index == FIELD_TERMINAL_SIZE) {
             editFontSize = (editFontSize + 1) % Profile.SIZE_LABELS.length;
             refreshEditor();
             return;
         }
+        if (index == FIELD_BRIDGE_TARGET && canAskBridge()) {
+            askBridgeForTargets();
+            return;
+        }
+        openTextBox(index);
+    }
 
+    /**
+     * Hands a field to TextBox, which is the platform's own full-screen editor.
+     * It knows this keyboard, its input modes and its capitalisation rules, and
+     * reimplementing that on a canvas would be worse in every way that matters.
+     */
+    private void openTextBox(int index) {
         editingField = index;
         String value;
         int size;
@@ -408,8 +443,17 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             case 3: value = editUser; size = 32;
                     constraints = TextField.EMAILADDR | TextField.NON_PREDICTIVE; break;
             case 4: value = editPassword; size = 64; constraints = TextField.PASSWORD; break;
-            case 8: value = editWsPath; size = 128;
+            case FIELD_WEBSOCKET_PATH: value = editWsPath; size = 128;
                     constraints = TextField.URL | TextField.NON_PREDICTIVE; break;
+            // Visible while it is typed, unlike the password. It is a long
+            // passphrase going into a phone keyboard, and one typed blind is
+            // one that gets a character wrong and cannot be found by looking.
+            // NON_PREDICTIVE still matters: without it the device's dictionary
+            // would learn the secret and offer it back in other applications.
+            case FIELD_BRIDGE_KEY: value = editBridgeKey; size = 128;
+                    constraints = TextField.ANY | TextField.NON_PREDICTIVE; break;
+            case FIELD_BRIDGE_TARGET: value = editBridgeTarget; size = 64;
+                    constraints = TextField.ANY | TextField.NON_PREDICTIVE; break;
             default: value = editKey; size = 2048; constraints = TextField.ANY; break;
         }
 
@@ -420,6 +464,117 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         display.setCurrent(entry);
     }
 
+    private boolean canAskBridge() {
+        return editHost.length() > 0 && editWsPath.length() > 0
+            && editBridgeKey.length() > 0;
+    }
+
+    /**
+     * Fetches the bridge's catalogue and offers it as a list.
+     *
+     * The point of the catalogue is that nobody has to know an address: the
+     * bridge names what it will reach and this shows the names. When it cannot
+     * be reached the field still has to be usable, so the failure lands on a
+     * text box rather than on a dead end — someone who already knows the name
+     * should not be stopped by a bridge that is briefly down.
+     */
+    private void askBridgeForTargets() {
+        final String host = editHost;
+        final int port = parsePort(editPort);
+        final String path = editWsPath;
+        final String key = editBridgeKey;
+
+        // Both this and the list it becomes are ways of filling in one field,
+        // so Back out of either belongs in the editor rather than at the
+        // connection list, which would throw away everything typed so far.
+        editingField = FIELD_BRIDGE_TARGET;
+
+        Form waiting = new Form("Bridge");
+        waiting.append("Asking " + host + " what it will reach...");
+        waiting.addCommand(back);
+        waiting.setCommandListener(this);
+        display.setCurrent(waiting);
+
+        // Off the event thread: opening a socket on this device can block for
+        // seconds while the radio comes up, and a blocked event thread is a
+        // frozen screen.
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    String[] names = fetchTargets(host, port, path, key);
+                    if (names.length == 0) {
+                        show("The bridge authenticated but offers no targets."
+                            + " Its config has none.", AlertType.WARNING, editor);
+                        return;
+                    }
+                    offerTargets(names);
+                } catch (IOException e) {
+                    show("Could not ask the bridge: " + e.getMessage(),
+                        AlertType.WARNING, textBoxFor(FIELD_BRIDGE_TARGET));
+                }
+            }
+        }).start();
+    }
+
+    private String[] fetchTargets(String host, int port, String path, String key)
+            throws IOException {
+        random.seed();
+        SocketConnection probe = openSocket(host, port);
+        try {
+            WebSocket ws = WebSocket.connect(probe.openInputStream(),
+                probe.openOutputStream(), host + ":" + port, path, random);
+            return BridgeAuth.authenticate(ws.inputStream(), ws.outputStream(), key);
+        } finally {
+            // Asked and answered; the session opens its own connection. Leaving
+            // this one attached would hold a thread on the bridge for nothing.
+            try {
+                probe.close();
+            } catch (IOException e) {
+                // Closing a probe that already failed is not worth reporting.
+            }
+        }
+    }
+
+    private void offerTargets(String[] names) {
+        offeredTargets = names;
+        if (targetPicker == null) {
+            targetPicker = new ListScreen("Bridge target", new ListScreen.Listener() {
+                public void selected(int index) {
+                    if (index >= 0 && index < offeredTargets.length) {
+                        editBridgeTarget = offeredTargets[index];
+                        editingField = -1;
+                        refreshEditor();
+                        display.setCurrent(editor);
+                    }
+                }
+            });
+            targetPicker.setHint("Menu to go back");
+            targetPicker.addCommand(back);
+            targetPicker.addCommand(quit);
+            targetPicker.setCommandListener(this);
+        }
+        String[] details = new String[names.length];
+        for (int i = 0; i < names.length; i++) {
+            // The bridge deliberately does not say where a name goes, so there
+            // is nothing truthful to put here but the fact that it will go.
+            details[i] = "reachable through the bridge";
+        }
+        targetPicker.setRows(names, details);
+        display.setCurrent(targetPicker);
+    }
+
+    /** The text box a field would open, without showing it. */
+    private TextBox textBoxFor(int index) {
+        editingField = index;
+        entry = new TextBox(FIELDS[index], index == FIELD_BRIDGE_TARGET
+            ? editBridgeTarget : "", 64,
+            TextField.ANY | TextField.NON_PREDICTIVE);
+        entry.addCommand(accept);
+        entry.addCommand(back);
+        entry.setCommandListener(this);
+        return entry;
+    }
+
     private void acceptField() {
         String value = entry.getString();
         switch (editingField) {
@@ -428,7 +583,9 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             case 2: editPort = value.trim(); break;
             case 3: editUser = value.trim(); break;
             case 4: editPassword = value; break;
-            case 8: editWsPath = value.trim(); break;
+            case FIELD_WEBSOCKET_PATH: editWsPath = value.trim(); break;
+            case FIELD_BRIDGE_KEY: editBridgeKey = value.trim(); break;
+            case FIELD_BRIDGE_TARGET: editBridgeTarget = value.trim(); break;
             default: editKey = value.trim(); break;
         }
         editingField = -1;
@@ -456,8 +613,28 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             }
         }
 
+        // Caught here rather than at connect time, for the same reason the key
+        // is: a setting that cannot work should be refused while the person who
+        // typed it is still looking at it.
+        if (editBridgeKey.length() > 0 && editWsPath.length() == 0) {
+            show("A bridge key needs a WebSocket path — that is how the bridge"
+                + " is reached.", AlertType.WARNING, editor);
+            return;
+        }
+        if (editBridgeKey.length() > 0 && editBridgeTarget.length() == 0) {
+            show("Choose a bridge target. Open that field and it will ask the"
+                + " bridge which ones it has.", AlertType.WARNING, editor);
+            return;
+        }
+        if (editBridgeTarget.length() > 0 && !BridgeAuth.isName(editBridgeTarget)) {
+            show("\"" + editBridgeTarget + "\" is not a target name: letters,"
+                + " digits, dot, dash and underscore only.", AlertType.WARNING, editor);
+            return;
+        }
+
         Profile profile = new Profile(name, editHost, parsePort(editPort), editUser,
-            editPassword, editSavePassword, editKey, editFontSize, editWsPath);
+            editPassword, editSavePassword, editKey, editFontSize, editWsPath,
+            editBridgeKey, editBridgeTarget);
         try {
             // Renaming replaces rather than duplicating.
             if (editingName != null && !editingName.equals(name)) {
@@ -548,16 +725,30 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
                     profile.webSocketPath(), random);
                 in = ws.inputStream();
                 out = ws.outputStream();
+
+                // The bridge decides whether this connection goes anywhere at
+                // all, and to which of its machines. Only then is there a
+                // stream for SSH — which still cannot tell any of this happened.
+                if (profile.authenticatesToBridge()) {
+                    canvas.setStatus("authenticating to the bridge...");
+                    BridgeAuth.authenticate(in, out, profile.bridgeKey());
+                    canvas.setStatus("opening " + profile.bridgeTarget() + "...");
+                    BridgeAuth.open(in, out, profile.bridgeTarget());
+                }
             }
 
             Connection connection = new Connection(in, out, random);
             HostKey key = connection.handshake();
 
-            int trust = KnownHosts.check(hostKeys, host, port, key);
+            // Not the host: through a bridge that is the relay, and every
+            // machine behind one would share a record. See Profile.
+            String identity = profile.hostKeyIdentity();
+
+            int trust = KnownHosts.check(hostKeys, identity, port, key);
             if (trust == KnownHosts.CHANGED) {
                 // Not a question. See KnownHosts for why there is no way past
                 // this short of forgetting the host deliberately.
-                fail(KnownHosts.mismatchWarning(host, port, key));
+                fail(KnownHosts.mismatchWarning(identity, port, key));
                 return;
             }
             if (trust == KnownHosts.UNKNOWN) {
@@ -567,11 +758,12 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
                 // accepted silently, and its key stored — so every later
                 // connection to the real server would raise a mismatch and the
                 // impostor would be the one that looked legitimate.
-                if (!ask("Unknown host", KnownHosts.firstContactPrompt(host, port, key))) {
+                if (!ask("Unknown host",
+                        KnownHosts.firstContactPrompt(identity, port, key))) {
                     fail("Host key rejected. Nothing was stored.");
                     return;
                 }
-                KnownHosts.accept(hostKeys, host, port, key);
+                KnownHosts.accept(hostKeys, identity, port, key);
             }
 
             UserAuth auth = new UserAuth(connection, profile.user());
@@ -671,10 +863,10 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         IOException last = null;
         for (int i = 0; i < transports.length; i++) {
             try {
-                canvas.setStatus("connecting" + transports[i]);
+                status("connecting" + transports[i]);
                 SocketConnection open = (SocketConnection)
                     Connector.open(address + transports[i], Connector.READ_WRITE);
-                canvas.setStatus("connected" + transports[i]);
+                status("connected" + transports[i]);
                 return open;
             } catch (IOException e) {
                 last = e;
@@ -682,6 +874,19 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         }
         throw new IOException("no transport reached " + host + ":" + port
             + " (last error: " + (last == null ? "none" : last.getMessage()) + ")");
+    }
+
+    /**
+     * Says what is happening, when there is somewhere to say it.
+     *
+     * {@link #openSocket} is used from the editor as well as from a session,
+     * and there is no terminal to write on while a connection is only being
+     * asked what it will reach.
+     */
+    private void status(String message) {
+        if (canvas != null) {
+            canvas.setStatus(message);
+        }
     }
 
     /**

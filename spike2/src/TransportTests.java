@@ -1,6 +1,7 @@
 import berryssh.device.Profile;
 import berryssh.protocol.Ascii;
 import berryssh.protocol.Base64;
+import berryssh.protocol.BridgeAuth;
 import berryssh.protocol.HostKey;
 import berryssh.protocol.KexInit;
 import berryssh.protocol.KeyExchange;
@@ -64,6 +65,7 @@ public class TransportTests {
         knownHostsPolicy();
         savedConnections();
         opensshPrivateKeys();
+        bridgeHandshake();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -804,6 +806,42 @@ public class TransportTests {
             checkTrue("the default port is left out of the label",
                 new Profile("", "example.org", 22, "bb", "", false)
                     .label().indexOf(":22") < 0);
+
+            Profile bridged = new Profile("pve", "ssh.example.org", 80, "root", "",
+                false, "", 0, "/", "correct horse battery staple", "pve");
+            Profile bridgedBack = Profile.decode(bridged.encode());
+            checkTrue("a bridge key and target round trip",
+                "correct horse battery staple".equals(bridgedBack.bridgeKey())
+                    && "pve".equals(bridgedBack.bridgeTarget())
+                    && bridgedBack.authenticatesToBridge()
+                    && bridgedBack.usesWebSocket());
+
+            // A record written by 0.6.0, byte for byte, rather than one this
+            // build produced and then read back. An upgrade that silently
+            // emptied the connection list would be worse than the feature that
+            // caused it, so the old layout is pinned here rather than trusted.
+            WireWriter old = new WireWriter(256);
+            old.writeUint32(3);
+            old.writeString(Utf8.encode("eski"));
+            old.writeString(Utf8.encode("example.org"));
+            old.writeUint32(2222);
+            old.writeString(Utf8.encode("cobanov"));
+            old.writeBoolean(true);
+            old.writeString(Utf8.encode("sifre"));
+            old.writeString(Utf8.encode(""));
+            old.writeUint32(1);
+            old.writeString(Utf8.encode("/pve"));
+            Profile upgraded = Profile.decode(old.toByteArray());
+            checkTrue("a connection saved by the previous version still loads",
+                "eski".equals(upgraded.name())
+                    && upgraded.port() == 2222
+                    && "sifre".equals(upgraded.password())
+                    && upgraded.fontSize() == 1
+                    && "/pve".equals(upgraded.webSocketPath()));
+            checkTrue("and it comes back with no bridge key, not a broken one",
+                upgraded.bridgeKey().length() == 0
+                    && upgraded.bridgeTarget().length() == 0
+                    && !upgraded.authenticatesToBridge());
         } catch (IOException e) {
             fail("saved connection round trip threw " + e);
         }
@@ -958,6 +996,142 @@ public class TransportTests {
         w.writeBoolean(guessing);
         w.writeUint32(0);
         return KexInit.parse(w.toByteArray());
+    }
+
+    /**
+     * The bridge handshake, driven against a scripted far side.
+     *
+     * Every refusal is checked as well as the acceptance. A bridge is the one
+     * hop in this design that is neither the phone nor the server, so the ways
+     * it can say no are as much a part of the protocol as the way it says yes.
+     */
+    private static void bridgeHandshake() {
+        final String key = "correct horse battery staple";
+        final byte[] nonce = new byte[32];
+        for (int i = 0; i < nonce.length; i++) {
+            nonce[i] = (byte) (i * 7 + 1);
+        }
+        final String greeting = "BERRYSSH1 " + Base64.encode(nonce) + "\r\n";
+
+        // Written out rather than recomputed from BridgeAuth's own constants:
+        // a test that derives the answer the same way the code does agrees with
+        // the code by construction, including when both are wrong. This value
+        // came from Python's hmac over "berryssh-bridge-v1" || nonce, so it
+        // pins the message layout and the label against an implementation that
+        // shares no source with ours.
+        String expected = "AUTH V5wb0H+EPObOeu/x9dQaI6tnISgaUaQTN7kwPpCUg6A=";
+        checkTrue("the challenge is the one the vector was computed over",
+            Base64.encode(nonce).equals("AQgPFh0kKzI5QEdOVVxjanF4f4aNlJuiqbC3vsXM09o="));
+
+        try {
+            // The far side's bytes end with SSH's version string, which must
+            // still be there to read: a handshake that buffered ahead would
+            // have swallowed it, and the failure would surface much later as an
+            // unreadable server version.
+            ByteArrayInputStream in = new ByteArrayInputStream(Ascii.toBytes(
+                greeting + "OK  pve   ct107 \r\nREADY\r\nSSH-2.0-OpenSSH_9.2p1\r\n"));
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+
+            String[] targets = BridgeAuth.authenticate(in, out, key);
+            checkTrue("the bridge catalogue is read",
+                targets.length == 2 && targets[0].equals("pve")
+                    && targets[1].equals("ct107"));
+
+            String sent = new String(out.toByteArray(), "ISO8859_1");
+            checkTrue("the client signs the label and the nonce",
+                sent.equals(expected + "\r\n"));
+
+            BridgeAuth.open(in, out, "pve");
+            checkTrue("OPEN names the target",
+                new String(out.toByteArray(), "ISO8859_1")
+                    .endsWith("OPEN pve\r\n"));
+
+            byte[] rest = new byte[21];
+            int n = in.read(rest, 0, rest.length);
+            checkTrue("nothing past READY is consumed",
+                n == 21 && new String(rest, 0, n, "ISO8859_1")
+                    .equals("SSH-2.0-OpenSSH_9.2p1"));
+        } catch (IOException e) {
+            fail("the bridge handshake completes (threw " + e + ")");
+        }
+
+        checkRejected("a refused key is reported", new Fallible() {
+            public void run() throws IOException {
+                BridgeAuth.authenticate(
+                    new ByteArrayInputStream(Ascii.toBytes(greeting + "ERR auth\r\n")),
+                    new ByteArrayOutputStream(), "wrong");
+            }
+        });
+
+        // A plain WebSocket-to-TCP proxy pipes immediately and never answers a
+        // question. Telling those apart matters: the fix is to clear the bridge
+        // key, not to correct it.
+        checkRejected("a proxy that does not authenticate is recognised",
+            new Fallible() {
+                public void run() throws IOException {
+                    BridgeAuth.authenticate(
+                        new ByteArrayInputStream(
+                            Ascii.toBytes("SSH-2.0-OpenSSH_9.2p1\r\n")),
+                        new ByteArrayOutputStream(), key);
+                }
+            });
+
+        checkRejected("a short challenge is refused", new Fallible() {
+            public void run() throws IOException {
+                BridgeAuth.authenticate(
+                    new ByteArrayInputStream(Ascii.toBytes(
+                        "BERRYSSH1 " + Base64.encode(new byte[8]) + "\r\nOK a\r\n")),
+                    new ByteArrayOutputStream(), key);
+            }
+        });
+
+        checkRejected("a closed connection is not a silent success",
+            new Fallible() {
+                public void run() throws IOException {
+                    BridgeAuth.authenticate(new ByteArrayInputStream(new byte[0]),
+                        new ByteArrayOutputStream(), key);
+                }
+            });
+
+        checkRejected("a target the bridge will not open is reported",
+            new Fallible() {
+                public void run() throws IOException {
+                    BridgeAuth.open(
+                        new ByteArrayInputStream(Ascii.toBytes("ERR no such target\r\n")),
+                        new ByteArrayOutputStream(), "pve");
+                }
+            });
+
+        // Refused before it is sent: a name with a space would arrive as two
+        // words and open something nobody asked for.
+        checkRejected("a name with a space is never sent", new Fallible() {
+            public void run() throws IOException {
+                BridgeAuth.open(new ByteArrayInputStream(Ascii.toBytes("READY\r\n")),
+                    new ByteArrayOutputStream(), "pve ct107");
+            }
+        });
+        checkRejected("a name with a slash is never sent", new Fallible() {
+            public void run() throws IOException {
+                BridgeAuth.open(new ByteArrayInputStream(Ascii.toBytes("READY\r\n")),
+                    new ByteArrayOutputStream(), "../etc");
+            }
+        });
+
+        checkTrue("plain names are accepted", BridgeAuth.isName("ct107-personal.lan"));
+        checkTrue("an empty name is not", !BridgeAuth.isName(""));
+        checkTrue("a name with a newline is not", !BridgeAuth.isName("pve\nOPEN kvm"));
+
+        // A bridge with nothing configured should say so as an empty catalogue
+        // rather than by failing, so the phone can explain what is wrong.
+        try {
+            String[] none = BridgeAuth.authenticate(
+                new ByteArrayInputStream(Ascii.toBytes(greeting + "OK\r\n")),
+                new ByteArrayOutputStream(), key);
+            checkTrue("a bridge with no targets returns an empty catalogue",
+                none.length == 0);
+        } catch (IOException e) {
+            fail("a bridge with no targets returns an empty catalogue (threw " + e + ")");
+        }
     }
 
     private static Transport transportOver(String ascii) {

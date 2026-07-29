@@ -1,37 +1,72 @@
 # Installing the WebSocket bridge
 
-The client half is done and tested. This is the server half, which touches a
-machine of yours and so is yours to run.
+The client half is done and tested. This is the server half, which touches
+machines of yours and so is yours to run.
 
-## What it does, and what it exposes
+## What this gets you
 
-A path on an existing HTTP hostname becomes a way to reach one SSH server. The
-handset connects to `ws://<host>/<path>`, the bridge unwraps the frames and
-connects onward to the address that path is mapped to.
+A handset that can reach any machine on your tailnet, without running Tailscale
+— which it cannot. Being a VPN means capturing the whole device's traffic, and
+on BlackBerry OS 7 that lives behind RIM's signed VPN framework, which this
+project cannot enter. So the phone never joins the tailnet. The bridge does,
+and carries the phone's SSH stream in.
 
-**Read this part before running it.** A path that is reachable from the
-internet and lands on `sshd` is, in security terms, a port forward to that
-`sshd` — with three differences, all in its favour:
+Tailscale Funnel would have avoided all of the plumbing below, and does not
+work here: it listens only on 443/8443/10000 and only over TLS, and this client
+has no TLS. Even with it, Funnel's certificates come from Let's Encrypt, whose
+root is from 2015 while the 9790's trust store stopped being updated in 2013.
 
-- Only the addresses in `targets` can be dialled. Nothing else is reachable, no
-  matter what path is requested, so it is not an open proxy into the LAN.
-- No router port is opened. It rides the Cloudflare tunnel that is already
-  there, so it inherits whatever rate limiting and DDoS handling that has.
-- The bridge listens on loopback only. The reverse proxy in front is the only
-  thing that can reach it.
+## What it exposes, and what holds it
 
-What it does *not* do is add authentication of its own. The protection is
-`sshd`'s: those hosts take keys and not passwords. The bridge carries ciphertext
-it cannot read, and the client checks the host key, so a bridge that was
-tampered with or replaced would be refused at the far end rather than silently
-trusted.
+A path on a public hostname becomes a way to reach SSH on machines you name.
+Read this part before running it — the protection is three independent layers,
+and the first is the one that actually bounds the damage.
+
+**1. The Tailscale policy.** Give the bridge a tagged identity rather than your
+own, and grant it only what it needs:
+
+```json
+{
+  "tagOwners": { "tag:berryssh-bridge": ["autogroup:admin"],
+                 "tag:phone-reachable": ["autogroup:admin"] },
+  "grants": [
+    { "src": ["tag:berryssh-bridge"],
+      "dst": ["tag:phone-reachable"],
+      "ip":  ["tcp:22"] }
+  ]
+}
+```
+
+Then tag the machines the phone should reach with `tag:phone-reachable`. A
+bridge running attacker code still reaches nothing but port 22 on those, which
+is the property worth having: the config below stops being the only thing
+standing between a public path and your network.
+
+**2. A pre-shared key.** The bridge refuses to start without one. Nothing —
+not even the list of machines it serves — is disclosed before it is proved.
+
+**3. SSH itself.** Key authentication at the far end, host key verification at
+the near one. The bridge carries ciphertext it cannot read, and one that was
+swapped or tampered with is refused by the handset rather than trusted.
+
+What this does **not** do is encrypt the outer layer. `ws://` is plaintext, so
+an observer on the path sees that you connected and which name you asked for.
+They do not see the session: SSH already provides confidentiality, integrity
+and both ends' identities. TLS here would buy metadata privacy, not security.
 
 If that trade is not one you want, do not install it — the handset can still
 reach anything on the LAN when it is at home.
 
+## Where to run it
+
+**Not on the machine that faces the internet.** Put it on an internal node and
+have the public reverse proxy reach it over the LAN. Then a compromise of the
+public box yields no tailnet identity at all. Splitting them costs one config
+line and removes a whole class of bad day.
+
 ## Install
 
-On the edge container (CT103), as root:
+On the internal node, as root:
 
 ```sh
 mkdir -p /opt/wsbridge
@@ -39,17 +74,36 @@ curl -fsSL -o /opt/wsbridge/wsbridge.py \
   https://raw.githubusercontent.com/cobanov/berryssh/main/tools/wsbridge.py
 ```
 
-Write `/opt/wsbridge/config.json` with only the hosts you want reachable:
+Join the tailnet with a tagged, **non-reusable** auth key (create it in the
+admin console with Tags enabled):
+
+```sh
+tailscale up --auth-key=tskey-... --advertise-tags=tag:berryssh-bridge
+```
+
+Generate a key. Do not invent one by hand — this is the whole of layer 2:
+
+```sh
+head -c 24 /dev/urandom | base64
+```
+
+Write `/opt/wsbridge/config.json`, naming only the machines you want reachable.
+The names are what the handset will show; the addresses are never sent to it.
 
 ```json
 {
   "listen": 8022,
   "bind": "127.0.0.1",
+  "psk": "the base64 string you just generated",
   "targets": {
-    "/pve":   ["192.168.8.50", 22],
-    "/ct100": ["192.168.8.155", 22]
+    "pve":   ["100.76.56.16", 22],
+    "ct107": ["100.110.192.73", 22]
   }
 }
+```
+
+```sh
+chmod 600 /opt/wsbridge/config.json
 ```
 
 Write `/etc/systemd/system/wsbridge.service`:
@@ -77,12 +131,13 @@ WantedBy=multi-user.target
 systemctl daemon-reload && systemctl enable --now wsbridge
 ```
 
-Append to `/etc/caddy/Caddyfile` — Caddy passes WebSockets through
-`reverse_proxy` without any extra configuration:
+On the public node, append to `/etc/caddy/Caddyfile` — Caddy passes WebSockets
+through `reverse_proxy` with no extra configuration. Point it at the internal
+node's LAN address:
 
 ```
 ssh.cobanov.run:80 {
-	reverse_proxy 127.0.0.1:8022
+	reverse_proxy 192.168.8.56:8022
 }
 ```
 
@@ -101,16 +156,27 @@ curl -s -o /dev/null -w '%{http_code}\n' \
   -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
   -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
   -H 'Sec-WebSocket-Version: 13' \
-  http://ssh.cobanov.run/pve
+  http://ssh.cobanov.run/
 ```
 
-`101` means the bridge answered. `404` means that path is not in `targets`,
-which is what a wrong or probing path should get.
+`101` means the bridge answered and is now waiting to be authenticated. It will
+not say anything further, and will close, which is correct: `curl` does not
+have the key.
 
 ## On the handset
 
-In the connection editor set **Host** to `ssh.cobanov.run`, **Port** to `80`,
-and **WebSocket path** to `/pve`. Leave the path empty for an ordinary socket.
+In the connection editor:
 
-Host and port then address the HTTP endpoint rather than the SSH server — which
-one is reached is decided by the path, on the bridge.
+- **Host** `ssh.cobanov.run`, **Port** `80` — the HTTP entrance, not the SSH
+  server.
+- **WebSocket path** `/`
+- **Bridge key** — the string from `config.json`.
+- **Bridge target** — open it and it asks the bridge which names it has, then
+  offers them as a list. No address is ever typed into the phone.
+
+Leave **Bridge key** empty for an ordinary WebSocket-to-TCP proxy that asks for
+none; leave **WebSocket path** empty for a plain socket.
+
+Each target gets its own host key record, stored as `pve via ssh.cobanov.run`,
+so two machines behind one bridge do not look to the phone like one machine
+whose key keeps changing.
