@@ -1,27 +1,38 @@
 #!/usr/bin/env python3
 """A WebSocket-to-TCP bridge, so a client that can only speak HTTP can reach
-SSH.
+SSH — including SSH on a machine that is only reachable over Tailscale.
 
-The handset cannot run a VPN, and behind Cloudflare there is no raw TCP route
-into the network to fall back on. HTTP is what the entrance speaks, and a
-WebSocket is a TCP stream wearing an HTTP handshake — so this unwraps it and
-connects onward.
+The handset cannot run a VPN: being one means capturing the device's traffic,
+which on BlackBerry OS 7 lives behind RIM's signed VPN framework. So the phone
+never joins the tailnet. This does, and carries the phone's SSH stream in.
 
     wsbridge.py <config.json>
 
     {
       "listen": 8022,
+      "bind": "127.0.0.1",
+      "psk": "a long random passphrase, shared with the handset",
       "targets": {
-        "/pve":   ["192.168.8.50", 22],
-        "/ct100": ["192.168.8.155", 22]
+        "pve":   ["100.76.56.16", 22],
+        "ct107": ["100.110.192.73", 22]
       }
     }
 
-**The targets are an allowlist and that is the whole security model.** A bridge
-that connected wherever the path asked would be an open proxy into the network,
-reachable by anyone who found the hostname. Nothing outside this map is dialled.
+**A key is required, and the targets are an allowlist.** Between them they are
+the whole of this program's security model:
 
-Beyond that the protection is SSH's own: the servers take keys, and the client
+- Without the key, a connection learns nothing and reaches nothing. The bridge
+  is on a public hostname; anyone can find it, and finding it must not be
+  enough.
+- Nothing outside `targets` is ever dialled, whatever is asked for, so a
+  compromise here is not an open proxy into the network.
+
+Neither is the outermost bound, and neither should be trusted as if it were.
+Give this a *tagged* Tailscale identity whose grants allow only tcp:22 to the
+hosts it serves, and even a bridge running attacker code reaches nothing else.
+See wsbridge-install.md.
+
+Beyond that the protection is SSH's own: the servers take keys, the client
 checks the host key, so the bridge carries ciphertext it cannot read and cannot
 usefully tamper with — a forged or swapped host key is refused at the far end.
 
@@ -29,15 +40,33 @@ Standard library only, so it runs anywhere Python does with nothing installed.
 """
 import base64
 import hashlib
+import hmac
 import json
+import os
+import re
 import socket
 import struct
 import sys
 import threading
+import time
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+LABEL = b"berryssh-bridge-v1"
+GREETING = "BERRYSSH1"
+
 MAX_HEADERS = 65536
 MAX_FRAME = 1 << 20
+MAX_LINE = 4096
+NONCE_BYTES = 32
+
+# What a target may be called: what survives an ASCII line protocol without
+# quoting, and what someone can retype from a handset.
+NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+# Long enough to make guessing over the network pointless, short enough that a
+# legitimate client never notices. Applied to every failure, so the reason for
+# one cannot be told from how long it took.
+FAILURE_DELAY = 1.0
 
 
 def read_request(conn):
@@ -99,18 +128,80 @@ def write_frame(conn, opcode, payload):
     conn.sendall(header + payload)
 
 
-def serve(conn, targets):
+class Framed:
+    """The frames as a byte stream, so the handshake can be read a line at a
+    time and whatever follows it handed on untouched.
+
+    The leftover matters: the client is free to put its OPEN line and the first
+    bytes of SSH in one frame, and those bytes belong upstream, not on the
+    floor.
+    """
+
+    def __init__(self, conn):
+        self.conn = conn
+        self.buffer = b""
+        self.closed = False
+
+    def _fill(self):
+        while True:
+            opcode, payload = read_frame(self.conn)
+            if opcode == 0x8:
+                self.closed = True
+                return
+            if opcode == 0x9:
+                write_frame(self.conn, 0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in (0x0, 0x1, 0x2):
+                self.buffer += payload
+                return
+
+    def read_line(self):
+        while b"\n" not in self.buffer:
+            if len(self.buffer) > MAX_LINE:
+                raise ConnectionError("line too long")
+            self._fill()
+            if self.closed:
+                raise ConnectionError("closed during handshake")
+        line, _, rest = self.buffer.partition(b"\n")
+        self.buffer = rest
+        return line.decode("latin-1", "replace").rstrip("\r")
+
+    def take_pending(self):
+        pending, self.buffer = self.buffer, b""
+        return pending
+
+    def write_line(self, text):
+        write_frame(self.conn, 0x2, (text + "\r\n").encode("ascii"))
+
+
+def authenticate(stream, psk):
+    """Challenge, verify, and return the catalogue. Raises on refusal."""
+    nonce = os.urandom(NONCE_BYTES)
+    stream.write_line(GREETING + " " + base64.b64encode(nonce).decode())
+
+    line = stream.read_line()
+    if not line.startswith("AUTH "):
+        raise PermissionError("expected AUTH")
+
+    expected = hmac.new(psk, LABEL + nonce, hashlib.sha256).digest()
+    try:
+        offered = base64.b64decode(line[5:].strip(), validate=True)
+    except Exception:
+        raise PermissionError("malformed tag")
+    # compare_digest, not ==: a comparison that stops at the first wrong byte
+    # tells an attacker how much of a guess was right.
+    if not hmac.compare_digest(offered, expected):
+        raise PermissionError("bad key")
+
+
+def serve(conn, targets, psk):
     upstream = None
     try:
         path, key = read_request(conn)
         if not key:
             conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-            return
-        target = targets.get(path)
-        if target is None:
-            # Named rather than described: someone probing gets no map of what
-            # else might be here.
-            conn.sendall(b"HTTP/1.1 404 Not Found\r\n\r\n")
             return
 
         accept = base64.b64encode(
@@ -125,8 +216,41 @@ def serve(conn, targets):
             ).encode()
         )
 
+        stream = Framed(conn)
+        try:
+            authenticate(stream, psk)
+        except PermissionError:
+            # Named rather than described, and slowly: someone guessing learns
+            # only that they guessed wrong.
+            time.sleep(FAILURE_DELAY)
+            try:
+                stream.write_line("ERR auth")
+            except Exception:
+                pass
+            return
+
+        # The catalogue is the answer to authenticating. Nobody has to know an
+        # address to use this, and nobody who has not authenticated sees one.
+        stream.write_line("OK " + " ".join(sorted(targets)))
+
+        line = stream.read_line()
+        if not line.startswith("OPEN "):
+            stream.write_line("ERR expected OPEN")
+            return
+        name = line[5:].strip()
+        target = targets.get(name) if NAME.match(name or "") else None
+        if target is None:
+            stream.write_line("ERR no such target")
+            return
+
         upstream = socket.create_connection((target[0], target[1]), timeout=15)
         upstream.settimeout(None)
+        stream.write_line("READY")
+
+        # Anything that arrived in the same frame as OPEN is already SSH.
+        pending = stream.take_pending()
+        if pending:
+            upstream.sendall(pending)
 
         def pump_up():
             try:
@@ -167,7 +291,22 @@ def serve(conn, targets):
 
 def main():
     config = json.load(open(sys.argv[1]))
-    targets = {k: (v[0], int(v[1])) for k, v in config["targets"].items()}
+
+    # Refused at startup rather than defaulted: a bridge with no key is the
+    # thing this program exists to not be, and leaving a field out should not
+    # be a way to get one.
+    psk = config.get("psk", "")
+    if len(psk) < 16:
+        sys.exit("config needs a \"psk\" of at least 16 characters")
+
+    targets = {}
+    for name, value in config["targets"].items():
+        if not NAME.match(name):
+            sys.exit(f"target name {name!r} must match {NAME.pattern}")
+        targets[name] = (value[0], int(value[1]))
+    if not targets:
+        sys.exit("config needs at least one target")
+
     listen = int(config.get("listen", 8022))
     # Bound to loopback: the only thing that should reach it is the reverse
     # proxy in front, which is what terminates the public hostname.
@@ -176,9 +315,11 @@ def main():
     server.bind((config.get("bind", "127.0.0.1"), listen))
     server.listen(32)
     print(f"wsbridge on {listen}, {len(targets)} target(s)", flush=True)
+
+    key = psk.encode("utf-8")
     while True:
         conn, _ = server.accept()
-        threading.Thread(target=serve, args=(conn, targets), daemon=True).start()
+        threading.Thread(target=serve, args=(conn, targets, key), daemon=True).start()
 
 
 if __name__ == "__main__":

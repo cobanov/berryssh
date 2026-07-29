@@ -1,4 +1,5 @@
 import berryssh.crypto.EntropyPool;
+import berryssh.protocol.BridgeAuth;
 import berryssh.protocol.Channel;
 import berryssh.protocol.Connection;
 import berryssh.protocol.HostKey;
@@ -62,6 +63,7 @@ public class ServerTests {
         survivesARekey();
         authenticatesWithAKey();
         reachesAServerThroughAWebSocket();
+        refusesAWrongBridgeKey();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -678,13 +680,18 @@ public class ServerTests {
         }
     }
 
+    /** What tools/wsbridge-test.json is started with. Not a secret; a fixture. */
+    private static final String BRIDGE_KEY = "spike2-bridge-key-not-a-secret";
+    private static final String BRIDGE_TARGET = "testserver";
+
     /**
-     * A full session carried inside a WebSocket.
+     * A full session carried inside an authenticated WebSocket bridge.
      *
      * This is how the handset reaches a network whose only entrance speaks
      * HTTP: it cannot run a VPN, and behind Cloudflare there is no raw TCP
      * route to fall back on. The bridge on the far side turns the frames back
-     * into a socket.
+     * into a socket — but only for someone holding the key, and only to a
+     * machine it was configured to reach.
      *
      * The bridge used here is written from RFC 6455 independently of the
      * client, which is the point — a client tested against its own idea of the
@@ -704,8 +711,14 @@ public class ServerTests {
             random.seed();
 
             WebSocket ws = WebSocket.connect(socket.getInputStream(), socket.getOutputStream(),
-                host + ":8090", "/ssh", random);
+                host + ":8090", "/", random);
             checkTrue("the bridge upgrades the connection", ws != null);
+
+            String[] targets = BridgeAuth.authenticate(
+                ws.inputStream(), ws.outputStream(), BRIDGE_KEY);
+            checkTrue("the bridge names what it will reach",
+                contains(targets, BRIDGE_TARGET));
+            BridgeAuth.open(ws.inputStream(), ws.outputStream(), BRIDGE_TARGET);
 
             // From here nothing knows it is not a socket, which is the whole
             // reason Connection was built to take streams.
@@ -740,6 +753,70 @@ public class ServerTests {
         } finally {
             socket.close();
         }
+    }
+
+    /**
+     * The other half of the bridge's job: refusing.
+     *
+     * Run against the same bridge and the same reachable server, so a pass
+     * means the key was what stopped it and not something incidental. Without
+     * this the suite would prove the door opens and say nothing about whether
+     * it is ever shut.
+     */
+    private static void refusesAWrongBridgeKey() throws Exception {
+        Socket socket;
+        try {
+            socket = new Socket(host, 8090);
+        } catch (IOException e) {
+            System.out.println("  SKIP  websocket refusal: nothing on " + host + ":8090");
+            return;
+        }
+        try {
+            socket.setSoTimeout(20000);
+            EntropyPool random = new EntropyPool();
+            random.seed();
+
+            WebSocket ws = WebSocket.connect(socket.getInputStream(), socket.getOutputStream(),
+                host + ":8090", "/", random);
+            try {
+                BridgeAuth.authenticate(ws.inputStream(), ws.outputStream(),
+                    BRIDGE_KEY + "x");
+                checkTrue("a wrong bridge key is refused", false);
+            } catch (IOException e) {
+                checkTrue("a wrong bridge key is refused", true);
+            }
+        } finally {
+            socket.close();
+        }
+
+        // And a name the bridge does not have gets nothing, even with the key.
+        Socket second = new Socket(host, 8090);
+        try {
+            second.setSoTimeout(20000);
+            EntropyPool random = new EntropyPool();
+            random.seed();
+
+            WebSocket ws = WebSocket.connect(second.getInputStream(),
+                second.getOutputStream(), host + ":8090", "/", random);
+            BridgeAuth.authenticate(ws.inputStream(), ws.outputStream(), BRIDGE_KEY);
+            try {
+                BridgeAuth.open(ws.inputStream(), ws.outputStream(), "not-configured");
+                checkTrue("a target outside the allowlist is refused", false);
+            } catch (IOException e) {
+                checkTrue("a target outside the allowlist is refused", true);
+            }
+        } finally {
+            second.close();
+        }
+    }
+
+    private static boolean contains(String[] values, String wanted) {
+        for (int i = 0; i < values.length; i++) {
+            if (wanted.equals(values[i])) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String join(String[] names) {

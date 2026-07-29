@@ -1,5 +1,6 @@
 import berryssh.crypto.ChaCha20;
 import berryssh.crypto.EntropyPool;
+import berryssh.crypto.Hmac;
 import berryssh.crypto.Poly1305;
 import berryssh.crypto.ScalarModL;
 import berryssh.crypto.Ed25519;
@@ -12,7 +13,8 @@ import berryssh.crypto.X25519;
  * bootclasspath at -source 1.3 (so they are provably device-compatible) but the
  * tests run on the host JVM, which keeps verification off the device entirely.
  *
- * Vectors: FIPS 180-4 (SHA-256), RFC 8439 sections 2.4.2 / 2.5.2 / 2.8.2.
+ * Vectors: FIPS 180-4 (SHA-256), RFC 8439 sections 2.4.2 / 2.5.2 / 2.8.2,
+ * RFC 4231 (HMAC-SHA-256).
  */
 public class CryptoTests {
 
@@ -21,6 +23,7 @@ public class CryptoTests {
 
     public static void main(String[] args) {
         sha256Vectors();
+        hmacVectors();
         chacha20Vector();
         poly1305Vector();
         aeadVector();
@@ -69,6 +72,65 @@ public class CryptoTests {
         check("SHA-256 streaming matches one-shot",
             streaming.digest(),
             "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+    }
+
+    /**
+     * RFC 4231 sections 4.2, 4.3, 4.4, 4.6 and 4.7.
+     *
+     * Cases 6 and 7 are the ones that matter most here: their keys are longer
+     * than SHA-256's block, so they exercise the hash-the-key-first path. The
+     * bridge key is a passphrase someone chose, which is exactly how a key
+     * longer than 64 bytes arrives in practice, and getting that path wrong
+     * fails only for long keys — quietly, and for one user in ten.
+     */
+    private static void hmacVectors() {
+        check("HMAC-SHA-256 RFC 4231 case 1",
+            Hmac.compute(repeat((byte) 0x0b, 20), ascii("Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+
+        check("HMAC-SHA-256 RFC 4231 case 2 (key shorter than the block)",
+            Hmac.compute(ascii("Jefe"), ascii("what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+
+        check("HMAC-SHA-256 RFC 4231 case 3",
+            Hmac.compute(repeat((byte) 0xaa, 20), repeat((byte) 0xdd, 50)),
+            "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
+
+        check("HMAC-SHA-256 RFC 4231 case 6 (key longer than the block)",
+            Hmac.compute(repeat((byte) 0xaa, 131),
+                ascii("Test Using Larger Than Block-Size Key - Hash Key First")),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+
+        check("HMAC-SHA-256 RFC 4231 case 7 (long key and long message)",
+            Hmac.compute(repeat((byte) 0xaa, 131),
+                ascii("This is a test using a larger than block-size key and a larger "
+                    + "than block-size data. The key needs to be hashed before being "
+                    + "used by the HMAC algorithm.")),
+            "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2");
+
+        // A key of exactly one block is neither padded nor hashed, so it is the
+        // boundary where an off-by-one in the branch would show.
+        checkTrue("HMAC-SHA-256 a 64-byte key is used as-is",
+            !toHex(Hmac.compute(repeat((byte) 0xaa, 64), ascii("x")))
+                .equals(toHex(Hmac.compute(SHA256.hash(repeat((byte) 0xaa, 64)),
+                    ascii("x")))));
+
+        checkTrue("tags that match compare equal",
+            Hmac.equal(Hmac.compute(ascii("k"), ascii("m")),
+                Hmac.compute(ascii("k"), ascii("m"))));
+        checkTrue("a tag under a different key does not",
+            !Hmac.equal(Hmac.compute(ascii("k"), ascii("m")),
+                Hmac.compute(ascii("K"), ascii("m"))));
+        checkTrue("tags of different lengths do not",
+            !Hmac.equal(new byte[32], new byte[31]));
+    }
+
+    private static byte[] repeat(byte value, int count) {
+        byte[] b = new byte[count];
+        for (int i = 0; i < count; i++) {
+            b[i] = value;
+        }
+        return b;
     }
 
     /** RFC 8439 section 2.4.2. */

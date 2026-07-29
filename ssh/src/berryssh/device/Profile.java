@@ -32,11 +32,12 @@ public final class Profile {
 
     /**
      * Records written before the private key and font size existed say 1.
-     * Both are read, so adding fields does not throw away what is saved — a
+     * All are read, so adding fields does not throw away what is saved — a
      * connection list that empties itself on upgrade is worse than the feature
      * is worth.
      */
-    private static final int FORMAT = 3;
+    private static final int FORMAT = 4;
+    private static final int FORMAT_WITHOUT_BRIDGE = 3;
     private static final int FORMAT_WITHOUT_WEBSOCKET = 2;
     private static final int FORMAT_WITHOUT_KEY = 1;
 
@@ -54,6 +55,8 @@ public final class Profile {
     private final String privateKey;
     private final int fontSize;
     private final String webSocketPath;
+    private final String bridgeKey;
+    private final String bridgeTarget;
 
     public Profile(String name, String host, int port, String user,
                    String password, boolean savePassword) {
@@ -68,6 +71,13 @@ public final class Profile {
     public Profile(String name, String host, int port, String user, String password,
                    boolean savePassword, String privateKey, int fontSize,
                    String webSocketPath) {
+        this(name, host, port, user, password, savePassword, privateKey, fontSize,
+            webSocketPath, "", "");
+    }
+
+    public Profile(String name, String host, int port, String user, String password,
+                   boolean savePassword, String privateKey, int fontSize,
+                   String webSocketPath, String bridgeKey, String bridgeTarget) {
         this.name = name;
         this.host = host;
         this.port = port;
@@ -77,6 +87,8 @@ public final class Profile {
         this.privateKey = privateKey == null ? "" : privateKey;
         this.fontSize = (fontSize < 0 || fontSize >= CELL_WIDTHS.length) ? 0 : fontSize;
         this.webSocketPath = webSocketPath == null ? "" : webSocketPath;
+        this.bridgeKey = bridgeKey == null ? "" : bridgeKey;
+        this.bridgeTarget = bridgeTarget == null ? "" : bridgeTarget;
     }
 
     public String name() {
@@ -136,6 +148,49 @@ public final class Profile {
         return webSocketPath.length() > 0;
     }
 
+    /**
+     * The secret shared with the bridge, or empty for a bridge that asks for
+     * none.
+     *
+     * Kept separate from the password because it authenticates a different
+     * party: this proves to the relay that it may carry the connection at all,
+     * while the password or key proves who is logging in at the far end. A
+     * bridge that learned the login would learn nothing useful anyway — it
+     * cannot read inside SSH — but they expire, rotate and leak separately, so
+     * they are stored separately.
+     */
+    public String bridgeKey() {
+        return bridgeKey;
+    }
+
+    /** Which of the bridge's named destinations to ask for. */
+    public String bridgeTarget() {
+        return bridgeTarget;
+    }
+
+    public boolean authenticatesToBridge() {
+        return bridgeKey.length() > 0;
+    }
+
+    /**
+     * What a stored host key belongs to.
+     *
+     * Through a bridge, {@link #host} is the bridge and not the server, so
+     * every machine behind one would otherwise share a single record: the
+     * second one connected to would present a different key for what the store
+     * believed was the same host, and be reported as a key that had changed.
+     * That warning is the one thing in this program that must never cry wolf.
+     *
+     * Naming the target instead makes each machine its own record, and reads
+     * correctly in the prompt: "pve via ssh.example.org:80".
+     */
+    public String hostKeyIdentity() {
+        if (bridgeTarget.length() > 0) {
+            return bridgeTarget + " via " + host;
+        }
+        return host;
+    }
+
     public String fontResource() {
         return "/fonts/mono" + cellWidth() + "x" + cellHeight() + ".png";
     }
@@ -168,14 +223,15 @@ public final class Profile {
         w.writeString(Utf8.encode(privateKey));
         w.writeUint32(fontSize);
         w.writeString(Utf8.encode(webSocketPath));
+        w.writeString(Utf8.encode(bridgeKey));
+        w.writeString(Utf8.encode(bridgeTarget));
         return w.toByteArray();
     }
 
     public static Profile decode(byte[] record) throws IOException {
         WireReader r = new WireReader(record);
         long format = r.readUint32();
-        if (format != FORMAT && format != FORMAT_WITHOUT_WEBSOCKET
-                && format != FORMAT_WITHOUT_KEY) {
+        if (format < FORMAT_WITHOUT_KEY || format > FORMAT) {
             // A record from a version that is not one of ours. Refusing it is
             // better than reading its fields in the wrong order.
             throw new SshException("saved connection is in format " + format
@@ -191,14 +247,20 @@ public final class Profile {
         String privateKey = "";
         int fontSize = 0;
         String webSocketPath = "";
+        String bridgeKey = "";
+        String bridgeTarget = "";
         if (format >= FORMAT_WITHOUT_WEBSOCKET) {
             privateKey = Utf8.decode(r.readString());
             fontSize = (int) r.readUint32();
         }
-        if (format >= FORMAT) {
+        if (format >= FORMAT_WITHOUT_BRIDGE) {
             webSocketPath = Utf8.decode(r.readString());
         }
+        if (format >= FORMAT) {
+            bridgeKey = Utf8.decode(r.readString());
+            bridgeTarget = Utf8.decode(r.readString());
+        }
         return new Profile(name, host, port, user, password, savePassword,
-            privateKey, fontSize, webSocketPath);
+            privateKey, fontSize, webSocketPath, bridgeKey, bridgeTarget);
     }
 }
