@@ -13,3 +13,6 @@ lib/*.jar
 /out/
 /classes/
 /classes-pv/
+
+# Fetched to generate the font atlases; not redistributed here
+/lib/fonts/

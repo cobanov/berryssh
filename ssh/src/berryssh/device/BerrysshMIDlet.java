@@ -43,7 +43,7 @@ import berryssh.terminal.VT320;
  */
 public final class BerrysshMIDlet extends MIDlet implements CommandListener {
 
-    private static final String FONT = "/fonts/BVSM8x14.png";
+    private static final String FONT = "/fonts/mono8x14.png";
     private static final int CELL_WIDTH = 8;
     private static final int CELL_HEIGHT = 14;
 
