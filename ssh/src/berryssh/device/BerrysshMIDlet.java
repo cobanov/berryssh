@@ -8,14 +8,12 @@ import javax.microedition.io.Connector;
 import javax.microedition.io.SocketConnection;
 import javax.microedition.lcdui.Alert;
 import javax.microedition.lcdui.AlertType;
-import javax.microedition.lcdui.Choice;
-import javax.microedition.lcdui.ChoiceGroup;
 import javax.microedition.lcdui.Command;
 import javax.microedition.lcdui.CommandListener;
 import javax.microedition.lcdui.Display;
 import javax.microedition.lcdui.Displayable;
 import javax.microedition.lcdui.Form;
-import javax.microedition.lcdui.List;
+import javax.microedition.lcdui.TextBox;
 import javax.microedition.lcdui.TextField;
 import javax.microedition.midlet.MIDlet;
 
@@ -62,6 +60,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
 
     // The editor
     private final Command save = new Command("Save", Command.OK, 1);
+    private final Command accept = new Command("OK", Command.OK, 1);
     private final Command back = new Command("Back", Command.BACK, 2);
 
     // The password prompt
@@ -81,22 +80,28 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     private final Command reconnect = new Command("Reconnect", Command.SCREEN, 7);
     private final Command disconnect = new Command("Disconnect", Command.STOP, 8);
 
+    private static final String[] FIELDS = {
+        "Name", "Host", "Port", "User", "Password", "Save password",
+        "Private key", "Terminal size"
+    };
+
     private Display display;
-    private List connections;
+    private ListScreen connections;
     private Profile[] profiles = new Profile[0];
 
-    private Form editor;
-    private TextField nameField;
-    private TextField hostField;
-    private TextField portField;
-    private TextField userField;
-    private TextField passwordField;
-    private ChoiceGroup savePasswordChoice;
-    private ChoiceGroup fontChoice;
-    private TextField keyField;
+    private ListScreen editor;
     private String editingName;
+    private String editName = "";
+    private String editHost = "";
+    private String editPort = "22";
+    private String editUser = "";
+    private String editPassword = "";
+    private boolean editSavePassword;
+    private String editKey = "";
+    private int editFontSize;
+    private int editingField = -1;
 
-    private TextField promptPassword;
+    private TextBox entry;
     private Profile pendingProfile;
 
     private TerminalCanvas canvas;
@@ -136,7 +141,12 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             }
         }).start();
 
-        connections = new List("berryssh", Choice.IMPLICIT);
+        connections = new ListScreen("berryssh", new ListScreen.Listener() {
+            public void selected(int index) {
+                open(index);
+            }
+        });
+        connections.setHint("Menu for New, Edit, Delete");
         connections.addCommand(connect);
         connections.addCommand(newConnection);
         connections.addCommand(edit);
@@ -160,16 +170,30 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         } catch (IOException e) {
             profiles = new Profile[0];
         }
-        connections.deleteAll();
+        String[] names = new String[profiles.length + 1];
+        String[] details = new String[profiles.length + 1];
         for (int i = 0; i < profiles.length; i++) {
-            connections.append(profiles[i].label(), null);
+            names[i] = profiles[i].name();
+            details[i] = profiles[i].user() + "@" + profiles[i].host()
+                + (profiles[i].port() == 22 ? "" : ":" + profiles[i].port());
         }
-        connections.append(NEW_CONNECTION, null);
+        names[profiles.length] = NEW_CONNECTION;
+        details[profiles.length] = "add a server";
+        connections.setRows(names, details);
+    }
+
+    /** A row of the connection list was chosen. */
+    private void open(int index) {
+        if (index >= profiles.length) {
+            showEditor(null);
+        } else {
+            begin(profiles[index]);
+        }
     }
 
     /** The profile the list is pointing at, or null for the New entry. */
     private Profile selected() {
-        int index = connections.getSelectedIndex();
+        int index = connections.selectedIndex();
         if (index < 0 || index >= profiles.length) {
             return null;
         }
@@ -184,13 +208,8 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         }
 
         if (from == connections) {
-            if (command == List.SELECT_COMMAND || command == connect) {
-                Profile profile = selected();
-                if (profile == null) {
-                    showEditor(null);
-                } else {
-                    begin(profile);
-                }
+            if (command == connect) {
+                open(connections.selectedIndex());
                 return;
             }
             if (command == newConnection) {
@@ -216,11 +235,22 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             }
         }
 
+        if (command == accept) {
+            acceptField();
+            return;
+        }
         if (command == save) {
             saveEditor();
             return;
         }
         if (command == back) {
+            // Out of a field goes back to the editor; out of anything else
+            // goes back to the list.
+            if (editingField >= 0) {
+                editingField = -1;
+                display.setCurrent(editor);
+                return;
+            }
             pendingProfile = null;
             refreshConnections();
             display.setCurrent(connections);
@@ -231,7 +261,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             pendingProfile = null;
             if (p != null) {
                 start(new Profile(p.name(), p.host(), p.port(), p.user(),
-                    promptPassword.getString(), false));
+                    entry.getString(), false, p.privateKey(), p.fontSize()));
             }
             return;
         }
@@ -294,66 +324,124 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
 
     private void showEditor(Profile profile) {
         editingName = profile == null ? null : profile.name();
-        editor = new Form(profile == null ? "New connection" : "Edit connection");
+        editName = profile == null ? "" : profile.name();
+        editHost = profile == null ? "" : profile.host();
+        editPort = profile == null ? "22" : "" + profile.port();
+        editUser = profile == null ? "" : profile.user();
+        editPassword = profile == null ? "" : profile.password();
+        editSavePassword = profile != null && profile.savePassword();
+        editKey = profile == null ? "" : profile.privateKey();
+        editFontSize = profile == null ? 0 : profile.fontSize();
 
-        nameField = new TextField("Name", profile == null ? "" : profile.name(),
-            32, TextField.ANY);
-        // URL and EMAILADDR put the device into an input mode that does not
-        // capitalise the first letter. TextField.ANY does, which made every
-        // host and user name start with a capital and need correcting by hand
-        // on a keyboard where that is several presses.
-        hostField = new TextField("Host", profile == null ? "" : profile.host(),
-            64, TextField.URL | TextField.NON_PREDICTIVE);
-        portField = new TextField("Port", profile == null ? "22" : "" + profile.port(),
-            5, TextField.NUMERIC);
-        userField = new TextField("User", profile == null ? "" : profile.user(),
-            32, TextField.EMAILADDR | TextField.NON_PREDICTIVE);
-        passwordField = new TextField("Password",
-            profile == null ? "" : profile.password(), 64, TextField.PASSWORD);
-        savePasswordChoice = new ChoiceGroup("", Choice.MULTIPLE,
-            new String[] { "Save password (not encrypted)" }, null);
-        savePasswordChoice.setSelectedIndex(0, profile != null && profile.savePassword());
-        // Pasted rather than typed: this is the contents of ~/.ssh/id_ed25519,
-        // which nobody is going to key in on a thumb keyboard.
-        keyField = new TextField("Private key (paste, optional)",
-            profile == null ? "" : profile.privateKey(), 2048, TextField.ANY);
-        fontChoice = new ChoiceGroup("Terminal size", Choice.EXCLUSIVE,
-            Profile.SIZE_LABELS, null);
-        fontChoice.setSelectedIndex(profile == null ? 0 : profile.fontSize(), true);
+        if (editor == null) {
+            editor = new ListScreen("Connection", new ListScreen.Listener() {
+                public void selected(int index) {
+                    editField(index);
+                }
+            });
+            editor.setHint("Menu to save or go back");
+            editor.addCommand(save);
+            editor.addCommand(back);
+            editor.addCommand(quit);
+            editor.setCommandListener(this);
+        }
+        refreshEditor();
+        display.setCurrent(editor);
+    }
 
-        editor.append(nameField);
-        editor.append(hostField);
-        editor.append(portField);
-        editor.append(userField);
-        editor.append(passwordField);
-        editor.append(savePasswordChoice);
-        editor.append(keyField);
-        editor.append(fontChoice);
-        editor.addCommand(save);
-        editor.addCommand(back);
-        editor.setCommandListener(this);
+    private void refreshEditor() {
+        String[] values = {
+            editName,
+            editHost,
+            editPort,
+            editUser,
+            // Never the password itself, even hidden behind asterisks whose
+            // count would give away its length.
+            editPassword.length() > 0 ? "set" : "not set",
+            editSavePassword ? "yes  (stored unencrypted)" : "no",
+            editKey.length() > 0 ? "set" : "not set  (paste id_ed25519)",
+            Profile.SIZE_LABELS[editFontSize]
+        };
+        String[] names = new String[FIELDS.length];
+        for (int i = 0; i < FIELDS.length; i++) {
+            names[i] = FIELDS[i];
+        }
+        editor.setRows(names, values);
+    }
+
+    /**
+     * Opens a field.
+     *
+     * The two that are a choice rather than a value just change; the rest hand
+     * over to TextBox, which is the platform's own full-screen editor. It knows
+     * this keyboard, its input modes and its capitalisation rules, and
+     * reimplementing that on a canvas would be worse in every way that matters.
+     */
+    private void editField(int index) {
+        if (index == 5) {
+            editSavePassword = !editSavePassword;
+            refreshEditor();
+            return;
+        }
+        if (index == 7) {
+            editFontSize = (editFontSize + 1) % Profile.SIZE_LABELS.length;
+            refreshEditor();
+            return;
+        }
+
+        editingField = index;
+        String value;
+        int size;
+        int constraints;
+        switch (index) {
+            case 0: value = editName; size = 32; constraints = TextField.ANY; break;
+            // URL and EMAILADDR put the device into an input mode that does not
+            // capitalise the first letter. ANY does, which made every host and
+            // user name need correcting by hand.
+            case 1: value = editHost; size = 64;
+                    constraints = TextField.URL | TextField.NON_PREDICTIVE; break;
+            case 2: value = editPort; size = 5; constraints = TextField.NUMERIC; break;
+            case 3: value = editUser; size = 32;
+                    constraints = TextField.EMAILADDR | TextField.NON_PREDICTIVE; break;
+            case 4: value = editPassword; size = 64; constraints = TextField.PASSWORD; break;
+            default: value = editKey; size = 2048; constraints = TextField.ANY; break;
+        }
+
+        entry = new TextBox(FIELDS[index], value, size, constraints);
+        entry.addCommand(accept);
+        entry.addCommand(back);
+        entry.setCommandListener(this);
+        display.setCurrent(entry);
+    }
+
+    private void acceptField() {
+        String value = entry.getString();
+        switch (editingField) {
+            case 0: editName = value.trim(); break;
+            case 1: editHost = value.trim(); break;
+            case 2: editPort = value.trim(); break;
+            case 3: editUser = value.trim(); break;
+            case 4: editPassword = value; break;
+            default: editKey = value.trim(); break;
+        }
+        editingField = -1;
+        refreshEditor();
         display.setCurrent(editor);
     }
 
     private void saveEditor() {
-        String host = hostField.getString().trim();
-        String user = userField.getString().trim();
-        if (host.length() == 0 || user.length() == 0) {
+        if (editHost.length() == 0 || editUser.length() == 0) {
             show("A host and a user are needed.", AlertType.WARNING, editor);
             return;
         }
-        String name = nameField.getString().trim();
-        if (name.length() == 0) {
-            name = host;
-        }
+        String name = editName.length() == 0 ? editHost : editName;
 
         // Checked here rather than at connect time: a key that will not parse
-        // should be rejected while the person who pasted it is still looking
-        // at it, not three screens later against a server.
-        String key = keyField.getString().trim();
-        if (key.length() > 0) {
+        // should be rejected while the person who pasted it is still looking at
+        // it, not three screens later against a server.
+        if (editKey.length() > 0) {
             try {
-                OpenSshKey.readEd25519Seed(key);
+                OpenSshKey.readEd25519Seed(editKey);
             } catch (IOException e) {
                 show("That key cannot be read: " + e.getMessage(),
                     AlertType.WARNING, editor);
@@ -361,9 +449,8 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             }
         }
 
-        Profile profile = new Profile(name, host, parsePort(portField.getString()),
-            user, passwordField.getString(), savePasswordChoice.isSelected(0),
-            key, fontChoice.getSelectedIndex());
+        Profile profile = new Profile(name, editHost, parsePort(editPort), editUser,
+            editPassword, editSavePassword, editKey, editFontSize);
         try {
             // Renaming replaces rather than duplicating.
             if (editingName != null && !editingName.equals(name)) {
@@ -386,13 +473,12 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             return;
         }
         pendingProfile = profile;
-        Form prompt = new Form(profile.user() + "@" + profile.host());
-        promptPassword = new TextField("Password", "", 64, TextField.PASSWORD);
-        prompt.append(promptPassword);
-        prompt.addCommand(go);
-        prompt.addCommand(back);
-        prompt.setCommandListener(this);
-        display.setCurrent(prompt);
+        entry = new TextBox(profile.user() + "@" + profile.host(), "", 64,
+            TextField.PASSWORD);
+        entry.addCommand(go);
+        entry.addCommand(back);
+        entry.setCommandListener(this);
+        display.setCurrent(entry);
     }
 
     private void start(final Profile profile) {
