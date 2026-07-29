@@ -46,7 +46,9 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     private final Command control = new Command("Ctrl", Command.SCREEN, 1);
     private final Command escape = new Command("Esc", Command.SCREEN, 2);
     private final Command keys = new Command("Keys", Command.SCREEN, 3);
-    private final Command disconnect = new Command("Disconnect", Command.STOP, 4);
+    private final Command fullScreen = new Command("Full screen", Command.SCREEN, 4);
+    private final Command reconnect = new Command("Reconnect", Command.SCREEN, 5);
+    private final Command disconnect = new Command("Disconnect", Command.STOP, 6);
 
     private Display display;
     private Form setup;
@@ -65,6 +67,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     private SocketConnection socket;
     private Channel channel;
     private volatile boolean running;
+    private boolean fullScreenOn;
 
     protected void startApp() {
         if (display != null) {
@@ -113,17 +116,34 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             startSession();
             return;
         }
+        // The keyboard only exists once a session has attached one, and these
+        // commands are in the menu from the moment the screen appears.
         if (command == control) {
-            keyboard.toggleControl();
-            canvas.repaint();
+            if (keyboard != null) {
+                keyboard.toggleControl();
+                canvas.repaint();
+            }
             return;
         }
         if (command == escape) {
-            keyboard.sendEscape();
+            if (keyboard != null) {
+                keyboard.sendEscape();
+            }
             return;
         }
         if (command == keys) {
             canvas.toggleKeyCodes();
+            return;
+        }
+        if (command == fullScreen) {
+            fullScreenOn = !fullScreenOn;
+            canvas.setFullScreen(fullScreenOn);
+            resizeTerminal();
+            return;
+        }
+        if (command == reconnect) {
+            shutdown();
+            startSession();
             return;
         }
         if (command == disconnect) {
@@ -155,7 +175,13 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         canvas.addCommand(control);
         canvas.addCommand(escape);
         canvas.addCommand(keys);
+        canvas.addCommand(fullScreen);
+        canvas.addCommand(reconnect);
         canvas.addCommand(disconnect);
+        // Quit belongs on this screen too. Reaching it only from the setup
+        // form means a session that will not disconnect cleanly is a session
+        // you cannot leave.
+        canvas.addCommand(quit);
         canvas.setCommandListener(this);
         canvas.setStatus("connecting to " + host + "...");
         display.setCurrent(canvas);
@@ -289,7 +315,17 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             + " (last error: " + (last == null ? "none" : last.getMessage()) + ")");
     }
 
+    /**
+     * Reports a fault, unless we caused it.
+     *
+     * Disconnecting closes the socket under a reader that is blocked on it, so
+     * the read fails by design. Showing that as an error would put a warning in
+     * front of a user who just chose to leave.
+     */
     private void fail(final String message) {
+        if (!running) {
+            return;
+        }
         canvas.setStatus("");
         show(message, AlertType.ERROR, setup);
     }
@@ -298,6 +334,29 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         Alert alert = new Alert("berryssh", message, null, type);
         alert.setTimeout(Alert.FOREVER);
         display.setCurrent(alert, next);
+    }
+
+    /**
+     * Re-agrees the terminal size after the screen changes shape.
+     *
+     * Both halves are needed: the emulator has to rewrap its buffer, and the
+     * server has to be told, or a full-screen program keeps drawing to the old
+     * dimensions and the display tears.
+     */
+    private void resizeTerminal() {
+        if (terminal == null || channel == null) {
+            return;
+        }
+        int columns = canvas.columns();
+        int rows = canvas.rows();
+        terminal.setScreenSize(columns, rows, true);
+        try {
+            channel.windowChange(columns, rows);
+        } catch (IOException e) {
+            // The session is already in trouble if this fails; the read loop
+            // will surface it with a better message than this could.
+        }
+        canvas.setStatus(columns + "x" + rows);
     }
 
     private static int parsePort(String text) {
