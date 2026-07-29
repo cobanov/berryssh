@@ -125,8 +125,15 @@ verification talks to one:
 
 ```sh
 tools/rekey-server.sh             # a second server that rekeys every 64 KB
+tools/ws-test-bridge.sh           # the WebSocket bridge, in another shell
 spike2/against-server.sh          # defaults to the project's container
 ```
+
+Each of those two covers something the shared container cannot: a rekey inside
+seconds instead of an hour, an authorised key, and an HTTP entrance to reach
+SSH through. When either is absent its tests print `SKIP` rather than passing
+quietly — a test that stops running without saying so is worse than one that
+fails.
 
 It is a separate script so that `run.sh` needs nothing external. The container
 still offers the 2011 algorithms as well as the modern ones, which is what
