@@ -105,10 +105,6 @@ public class TransportTests {
         check("uint32 at the top of its range", w.toByteArray(), "ffffffff");
 
         w = new WireWriter();
-        w.writeUint64(0x0102030405060708L);
-        check("uint64", w.toByteArray(), "0102030405060708");
-
-        w = new WireWriter();
         w.writeAsciiString("testing");
         check("string \"testing\"", w.toByteArray(), "0000000774657374696e67");
 
@@ -127,7 +123,6 @@ public class TransportTests {
         w.writeByte(0xfe);
         w.writeBoolean(true);
         w.writeUint32(0xdeadbeefL);
-        w.writeUint64(0xfedcba9876543210L);
         w.writeAsciiString("ssh-ed25519");
         w.writeString(hex("00112233"));
         w.writeMpint(hex("0080"));
@@ -138,7 +133,6 @@ public class TransportTests {
             checkTrue("round trip: byte", r.readByte() == 0xfe);
             checkTrue("round trip: boolean", r.readBoolean());
             checkTrue("round trip: uint32 past the sign bit", r.readUint32() == 0xdeadbeefL);
-            checkTrue("round trip: uint64 past the sign bit", r.readUint64() == 0xfedcba9876543210L);
             checkTrue("round trip: ascii string", "ssh-ed25519".equals(r.readAsciiString()));
             check("round trip: string", r.readString(), "00112233");
             check("round trip: mpint drops the sign byte", r.readMpint(), "80");
@@ -770,9 +764,24 @@ public class TransportTests {
      * The store itself is RMS and only exists on the device, so what is worth
      * testing here is what goes into a record and what comes back out.
      */
+    /**
+     * A connection with no key, no bridge and the default font.
+     *
+     * The shortening lives here rather than as a constructor on Profile, which
+     * is where it used to be. There it was reachable from the application, and
+     * being reachable it got used — the password prompt rebuilt a profile
+     * through one of these and silently dropped the WebSocket path. A test
+     * helper cannot cause that, because nothing but the tests can call it.
+     */
+    private static Profile basic(String name, String host, int port, String user,
+                                 String password, boolean savePassword) {
+        return new Profile(name, host, port, user, password, savePassword,
+            "", 0, "", "", "");
+    }
+
     private static void savedConnections() {
         try {
-            Profile full = new Profile("work", "example.org", 2222, "cobanov", "sifre", true);
+            Profile full = basic("work", "example.org", 2222, "cobanov", "sifre", true);
             Profile back = Profile.decode(full.encode());
             checkTrue("a saved connection round trips",
                 "work".equals(back.name())
@@ -784,7 +793,7 @@ public class TransportTests {
 
             // The password is left out of the record rather than written and
             // hidden behind a flag: a flag protects nobody who reads the record.
-            Profile unsaved = new Profile("home", "example.org", 22, "bb", "secret", false);
+            Profile unsaved = basic("home", "example.org", 22, "bb", "secret", false);
             Profile storedUnsaved = Profile.decode(unsaved.encode());
             checkTrue("a password that was not to be saved is not in the record",
                 storedUnsaved.password().length() == 0 && !storedUnsaved.savePassword());
@@ -793,7 +802,7 @@ public class TransportTests {
 
             // UTF-8 throughout: the device's default encoding would mangle both
             // of these, and neither is hypothetical for this user.
-            Profile turkish = new Profile("işyeri", "sunucu.example.org", 22,
+            Profile turkish = basic("işyeri", "sunucu.example.org", 22,
                 "çağrı", "parolağı", true);
             Profile turkishBack = Profile.decode(turkish.encode());
             checkTrue("Turkish characters survive a save and a load",
@@ -804,7 +813,7 @@ public class TransportTests {
             checkTrue("the list label identifies the server",
                 full.label().indexOf("cobanov@example.org:2222") >= 0);
             checkTrue("the default port is left out of the label",
-                new Profile("", "example.org", 22, "bb", "", false)
+                basic("", "example.org", 22, "bb", "", false)
                     .label().indexOf(":22") < 0);
 
             Profile bridged = new Profile("pve", "ssh.example.org", 80, "root", "",

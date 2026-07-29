@@ -34,13 +34,21 @@ public final class RecordStoreProfiles implements Profile.Store {
             int n = 0;
             while (records.hasNextElement()) {
                 byte[] record = records.nextRecord();
+                Profile profile;
                 try {
-                    found[n++] = Profile.decode(record);
+                    profile = Profile.decode(record);
                 } catch (IOException e) {
                     // A record this version cannot read is skipped rather than
                     // fatal: one unreadable entry should not cost the others.
-                    n--;
+                    continue;
                 }
+                // Decoded first, then stored. This used to be
+                // `found[n++] = Profile.decode(record)` with an `n--` in the
+                // catch, which was correct — Java evaluates the array index
+                // before the right-hand side, so a throw left n already
+                // incremented and the decrement put it back — but reading it
+                // required knowing that rule to see it was not an off-by-one.
+                found[n++] = profile;
             }
             Profile[] exact = new Profile[n];
             System.arraycopy(found, 0, exact, 0, n);

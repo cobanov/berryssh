@@ -377,44 +377,17 @@ public final class Transport {
     }
 
     /**
-     * Reads one CR-LF-terminated line, a byte at a time.
-     *
-     * Reading ahead in blocks would swallow the first packet, and CLDC has no
-     * BufferedInputStream to push the excess back into. The 255-byte cap counts
-     * only what is kept, which is marginally more tolerant than the RFC — worth
-     * it to not reject a server over its line ending.
+     * Reads one CR-LF-terminated line. The 255-byte cap counts only what is
+     * kept, which is marginally more tolerant than the RFC — worth it to not
+     * reject a server over its line ending. See {@link Lines} for why it is a
+     * byte at a time.
      */
     private String readLine() throws IOException {
-        byte[] line = new byte[MAX_VERSION_LINE];
-        int n = 0;
-        for (;;) {
-            int c = in.read();
-            if (c < 0) {
-                throw new SshException("connection closed during the version exchange");
-            }
-            if (c == '\n') {
-                break;
-            }
-            if (n == line.length) {
-                throw new SshException("version line longer than " + MAX_VERSION_LINE + " bytes");
-            }
-            line[n++] = (byte) c;
-        }
-        if (n > 0 && line[n - 1] == '\r') {
-            n--;
-        }
-        return Ascii.fromBytes(line, 0, n);
+        return Lines.read(in, MAX_VERSION_LINE, "server");
     }
 
     private void readFully(byte[] b, int offset, int length) throws IOException {
-        while (length > 0) {
-            int n = in.read(b, offset, length);
-            if (n < 0) {
-                throw new SshException("connection closed mid-packet");
-            }
-            offset += n;
-            length -= n;
-        }
+        Lines.readFully(in, b, offset, length, "connection");
     }
 
     /** CLDC's Random has no nextBytes, so the words are unpacked by hand. */

@@ -158,31 +158,13 @@ public final class BridgeAuth {
     }
 
     /**
-     * Reads one line, a byte at a time.
-     *
-     * Deliberately unbuffered: after READY the very next byte belongs to SSH,
-     * and a reader that had pulled ahead would have eaten the start of the
-     * server's version string.
+     * Reads one line. Unbuffered, and it matters here more than anywhere: after
+     * READY the very next byte belongs to SSH, and a reader that had pulled
+     * ahead would have eaten the start of the server's version string. See
+     * {@link Lines}.
      */
     private static String readLine(InputStream in) throws IOException {
-        StringBuffer line = new StringBuffer(64);
-        for (;;) {
-            int c = in.read();
-            if (c < 0) {
-                throw new SshException(line.length() == 0
-                    ? "the bridge closed without answering"
-                    : "the bridge closed mid-line");
-            }
-            if (c == '\n') {
-                return line.toString();
-            }
-            if (c != '\r') {
-                line.append((char) c);
-            }
-            if (line.length() > MAX_LINE) {
-                throw new SshException("the bridge sent an implausible line");
-            }
-        }
+        return Lines.read(in, MAX_LINE, "bridge");
     }
 
     private static void writeLine(OutputStream out, String line) throws IOException {

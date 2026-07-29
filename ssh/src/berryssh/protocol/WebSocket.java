@@ -117,25 +117,12 @@ public final class WebSocket {
         // it is unaffected by anything a relay does.
     }
 
-    /** Reads one CRLF-terminated header line, a byte at a time. */
+    /** The most a header line may be before the far side is not a bridge. */
+    private static final int MAX_HEADER = 8192;
+
+    /** See {@link Lines} for why this cannot read ahead. */
     private String readLine() throws IOException {
-        StringBuffer line = new StringBuffer(64);
-        for (;;) {
-            int c = in.read();
-            if (c < 0) {
-                throw new SshException("the bridge closed during the upgrade");
-            }
-            if (c == '\n') {
-                break;
-            }
-            if (c != '\r') {
-                line.append((char) c);
-            }
-            if (line.length() > 8192) {
-                throw new SshException("the bridge sent an implausible header");
-            }
-        }
-        return line.toString();
+        return Lines.read(in, MAX_HEADER, "bridge");
     }
 
     /** Sends one binary frame, masked as a client must. */
@@ -260,14 +247,7 @@ public final class WebSocket {
     }
 
     private void readFully(byte[] b, int offset, int length) throws IOException {
-        while (length > 0) {
-            int n = in.read(b, offset, length);
-            if (n < 0) {
-                throw new SshException("the bridge closed mid-frame");
-            }
-            offset += n;
-            length -= n;
-        }
+        Lines.readFully(in, b, offset, length, "bridge");
     }
 
     /** The bytes the far side sent, with the framing taken off. */
