@@ -32,9 +32,24 @@ public final class TerminalCanvas extends Canvas {
     private boolean showKeyCodes;
     private String lastKey = "";
 
+    /**
+     * Starts windowed rather than full screen, deliberately.
+     *
+     * Full screen buys about two more rows and costs the menu: MIDP does not
+     * promise that commands stay reachable without one, and on this device they
+     * do not. That trade is only ever worth making by choice — a terminal you
+     * cannot get out of is worse than a slightly shorter one, and there is no
+     * other way off this screen, since every command lives in that menu.
+     */
     public TerminalCanvas(BitmapFont font) {
         this.font = font;
-        setFullScreenMode(true);
+        setFullScreenMode(false);
+    }
+
+    /** The size changes, so the caller has to tell the session to resize too. */
+    public void setFullScreen(boolean on) {
+        setFullScreenMode(on);
+        repaint();
     }
 
     public void attach(VT320 terminal, Keyboard keyboard) {
