@@ -73,9 +73,59 @@ public final class Keyboard {
      * @param gameAction the canvas's game action for it, or 0
      */
     public void keyPressed(int keyCode, int gameAction) {
-        // The game actions come first: on this hardware they are the trackpad,
-        // and MIDP guarantees them where it guarantees nothing about the
-        // physical keys.
+        // A character is a character, whatever else the device calls it.
+        //
+        // This ordering is the whole point. MIDP lets a device map keys to game
+        // actions, and BlackBerry maps the letters — 'w' is UP, 'a' is LEFT,
+        // 's' is DOWN, 'd' is RIGHT — so that games written for a numeric
+        // keypad work on a QWERTY. Asking for the game action first therefore
+        // turns typing into cursor movement on exactly those letters, and
+        // leaves the rest working, which is what makes it look like a font or
+        // an encoding problem rather than a dispatch one.
+        //
+        // The trackpad and any dedicated cursor keys report no character, so
+        // they still reach the game actions below.
+        if (keyCode > 0 && isPrintable((char) keyCode)) {
+            type((char) keyCode);
+            return;
+        }
+
+        if (keyCode == BLACKBERRY_ESCAPE) {
+            sendEscape();
+            return;
+        }
+
+        switch (keyCode) {
+            case ASCII_CARRIAGE_RETURN:
+            case ASCII_LINE_FEED:
+                terminal.keyTyped(VT320.VK_ENTER, (char) 0, 0);
+                return;
+            case ASCII_BACKSPACE:
+                // Through keyPressed, not keyTyped. VT320 splits its input that
+                // way — its own dispatchKey routes backspace to keyPressed —
+                // and keyTyped drops it silently, so this sent nothing at all
+                // and there was no way to correct a typo.
+                terminal.keyPressed(VT320.VK_BACK_SPACE, 0);
+                return;
+            case ASCII_DELETE:
+                // Also backspace. VT320 has no keyPressed handling for DEL, and
+                // this handset has one deletion key rather than two — sending
+                // nothing because the codes differ in ASCII would be pedantry
+                // at the cost of the key working.
+                terminal.keyPressed(VT320.VK_BACK_SPACE, 0);
+                return;
+            case ASCII_TAB:
+                terminal.keyTyped(VT320.VK_TAB, (char) ASCII_TAB, 0);
+                return;
+            case ASCII_ESCAPE:
+                sendEscape();
+                return;
+            default:
+                break;
+        }
+
+        // Only now the game actions, which on this hardware means the trackpad
+        // and anything else with no character of its own.
         switch (gameAction) {
             case Canvas.UP:
                 terminal.keyPressed(VT320.VK_UP, 0);
@@ -93,37 +143,12 @@ public final class Keyboard {
                 break;
         }
 
-        if (keyCode == BLACKBERRY_ESCAPE) {
-            sendEscape();
-            return;
-        }
+        // A key we have no mapping for. Dropping it is right: inventing a
+        // character would put rubbish into the session, and the Keys readout is
+        // there to find out what it was.
+    }
 
-        switch (keyCode) {
-            case ASCII_CARRIAGE_RETURN:
-            case ASCII_LINE_FEED:
-                terminal.keyTyped(VT320.VK_ENTER, (char) 0, 0);
-                return;
-            case ASCII_BACKSPACE:
-            case ASCII_DELETE:
-                terminal.keyTyped(VT320.VK_BACK_SPACE, (char) ASCII_BACKSPACE, 0);
-                return;
-            case ASCII_TAB:
-                terminal.keyTyped(VT320.VK_TAB, (char) ASCII_TAB, 0);
-                return;
-            case ASCII_ESCAPE:
-                sendEscape();
-                return;
-            default:
-                break;
-        }
-
-        if (keyCode <= 0) {
-            // A negative code from a key we have no mapping for. Dropping it is
-            // right: inventing a character would put rubbish into the session.
-            return;
-        }
-
-        char c = (char) keyCode;
+    private void type(char c) {
         if (controlPending) {
             controlPending = false;
             int control = controlOf(c);
@@ -136,6 +161,17 @@ public final class Keyboard {
     }
 
     /**
+     * Whether this character is one a terminal should send as itself.
+     *
+     * The C1 range is excluded along with the C0 controls: those arrive as
+     * named keys handled above, and passing one through as a character would
+     * send a byte the far end reads as the start of an escape sequence.
+     */
+    public static boolean isPrintable(char c) {
+        return (c >= 32 && c < 127) || c > 159;
+    }
+
+    /**
      * The control character for a key, or -1 if there is none.
      *
      * Done by arithmetic on the ASCII ranges rather than by case folding. The
@@ -143,7 +179,7 @@ public final class Keyboard {
      * that is not 'I', so Ctrl-I would stop being Tab — silently, and only on
      * that one letter.
      */
-    static int controlOf(char c) {
+    public static int controlOf(char c) {
         if (c >= 'a' && c <= 'z') {
             return c - 'a' + 1;
         }

@@ -85,9 +85,14 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         }).start();
 
         setup = new Form("berryssh");
-        hostField = new TextField("Host", "", 64, TextField.URL);
+        // URL and EMAILADDR both put the device into an input mode that does
+        // not capitalise the first letter. TextField.ANY does, which made
+        // every username start with a capital and need correcting by hand.
+        hostField = new TextField("Host", "", 64,
+            TextField.URL | TextField.NON_PREDICTIVE);
         portField = new TextField("Port", "22", 5, TextField.NUMERIC);
-        userField = new TextField("User", "", 32, TextField.ANY);
+        userField = new TextField("User", "", 32,
+            TextField.EMAILADDR | TextField.NON_PREDICTIVE);
         passwordField = new TextField("Password", "", 64, TextField.PASSWORD);
         setup.append(hostField);
         setup.append(portField);
