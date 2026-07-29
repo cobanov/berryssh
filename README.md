@@ -155,6 +155,7 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
 - [x] Host key trust, stored in RMS
 - [x] VT320 terminal emulation, and a bitmap font renderer
 - [x] A MIDlet that connects, authenticates and runs a shell
+- [x] Runs on a Bold 9790: connects, authenticates, opens a shell
 - [ ] Keyboard mapping confirmed against the hardware's real key codes
 
 ## Prior art
