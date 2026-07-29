@@ -116,6 +116,18 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     private ListScreen targetPicker;
     private String[] offeredTargets = new String[0];
 
+    /**
+     * Which catalogue fetch is still wanted.
+     *
+     * The fetch runs on its own thread and cannot be interrupted out of a
+     * socket read, so leaving the field does not stop it — it only stops it
+     * mattering. Every fetch takes a number on the way in and checks it before
+     * it touches the screen; anything older has been abandoned and finishes
+     * quietly. Volatile because the two threads are the event thread and that
+     * one.
+     */
+    private volatile int catalogueRequest;
+
     private TextBox entry;
     private Profile pendingProfile;
 
@@ -263,6 +275,9 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             // goes back to the list.
             if (editingField >= 0) {
                 editingField = -1;
+                // Abandons a catalogue fetch that is still waiting on the
+                // bridge. Leaving the field is the answer to it.
+                catalogueRequest++;
                 display.setCurrent(editor);
                 return;
             }
@@ -343,6 +358,9 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     }
 
     private void showEditor(Profile profile) {
+        // A fetch left over from the connection edited before this one is
+        // answering a question about a bridge that is no longer on screen.
+        catalogueRequest++;
         editingName = profile == null ? null : profile.name();
         editName = profile == null ? "" : profile.name();
         editHost = profile == null ? "" : profile.host();
@@ -488,6 +506,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         // so Back out of either belongs in the editor rather than at the
         // connection list, which would throw away everything typed so far.
         editingField = FIELD_BRIDGE_TARGET;
+        final int generation = ++catalogueRequest;
 
         Form waiting = new Form("Bridge");
         waiting.append("Asking " + host + " what it will reach...");
@@ -502,6 +521,13 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             public void run() {
                 try {
                     String[] names = fetchTargets(host, port, path, key);
+                    // Checked after the network, not before it: the seconds
+                    // spent waiting are exactly when someone gives up and
+                    // presses Back, and answering then would drag them to a
+                    // screen they had already left.
+                    if (generation != catalogueRequest) {
+                        return;
+                    }
                     if (names.length == 0) {
                         show("The bridge authenticated but offers no targets."
                             + " Its config has none.", AlertType.WARNING, editor);
@@ -509,6 +535,9 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
                     }
                     offerTargets(names);
                 } catch (IOException e) {
+                    if (generation != catalogueRequest) {
+                        return;
+                    }
                     show("Could not ask the bridge: " + e.getMessage(),
                         AlertType.WARNING, textBoxFor(FIELD_BRIDGE_TARGET));
                 }
