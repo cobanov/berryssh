@@ -24,6 +24,7 @@ import berryssh.protocol.Channel;
 import berryssh.protocol.Connection;
 import berryssh.protocol.HostKey;
 import berryssh.protocol.KnownHosts;
+import berryssh.protocol.OpenSshKey;
 import berryssh.protocol.UserAuth;
 import berryssh.protocol.Utf8;
 import berryssh.terminal.BitmapFont;
@@ -42,10 +43,6 @@ import berryssh.terminal.VT320;
  * Written for -source 1.3: no generics, no enhanced for, no StringBuilder.
  */
 public final class BerrysshMIDlet extends MIDlet implements CommandListener {
-
-    private static final String FONT = "/fonts/mono8x14.png";
-    private static final int CELL_WIDTH = 8;
-    private static final int CELL_HEIGHT = 14;
 
     private static final String NEW_CONNECTION = "New connection...";
 
@@ -95,6 +92,8 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     private TextField userField;
     private TextField passwordField;
     private ChoiceGroup savePasswordChoice;
+    private ChoiceGroup fontChoice;
+    private TextField keyField;
     private String editingName;
 
     private TextField promptPassword;
@@ -314,6 +313,13 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         savePasswordChoice = new ChoiceGroup("", Choice.MULTIPLE,
             new String[] { "Save password (not encrypted)" }, null);
         savePasswordChoice.setSelectedIndex(0, profile != null && profile.savePassword());
+        // Pasted rather than typed: this is the contents of ~/.ssh/id_ed25519,
+        // which nobody is going to key in on a thumb keyboard.
+        keyField = new TextField("Private key (paste, optional)",
+            profile == null ? "" : profile.privateKey(), 2048, TextField.ANY);
+        fontChoice = new ChoiceGroup("Terminal size", Choice.EXCLUSIVE,
+            Profile.SIZE_LABELS, null);
+        fontChoice.setSelectedIndex(profile == null ? 0 : profile.fontSize(), true);
 
         editor.append(nameField);
         editor.append(hostField);
@@ -321,6 +327,8 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         editor.append(userField);
         editor.append(passwordField);
         editor.append(savePasswordChoice);
+        editor.append(keyField);
+        editor.append(fontChoice);
         editor.addCommand(save);
         editor.addCommand(back);
         editor.setCommandListener(this);
@@ -339,8 +347,23 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             name = host;
         }
 
+        // Checked here rather than at connect time: a key that will not parse
+        // should be rejected while the person who pasted it is still looking
+        // at it, not three screens later against a server.
+        String key = keyField.getString().trim();
+        if (key.length() > 0) {
+            try {
+                OpenSshKey.readEd25519Seed(key);
+            } catch (IOException e) {
+                show("That key cannot be read: " + e.getMessage(),
+                    AlertType.WARNING, editor);
+                return;
+            }
+        }
+
         Profile profile = new Profile(name, host, parsePort(portField.getString()),
-            user, passwordField.getString(), savePasswordChoice.isSelected(0));
+            user, passwordField.getString(), savePasswordChoice.isSelected(0),
+            key, fontChoice.getSelectedIndex());
         try {
             // Renaming replaces rather than duplicating.
             if (editingName != null && !editingName.equals(name)) {
@@ -357,7 +380,8 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
 
     /** Connects, asking for the password first when none was saved. */
     private void begin(Profile profile) {
-        if (profile.savePassword() && profile.password().length() > 0) {
+        if (profile.privateKey().length() > 0
+                || (profile.savePassword() && profile.password().length() > 0)) {
             start(profile);
             return;
         }
@@ -376,7 +400,8 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
 
         BitmapFont font;
         try {
-            font = BitmapFont.load(FONT, CELL_WIDTH, CELL_HEIGHT);
+            font = BitmapFont.load(profile.fontResource(),
+                profile.cellWidth(), profile.cellHeight());
         } catch (IOException e) {
             show("The font atlas is missing: " + e.getMessage(),
                 AlertType.ERROR, connections);
@@ -447,7 +472,21 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             UserAuth auth = new UserAuth(connection, profile.user());
             auth.begin();
             auth.queryMethods();
-            if (!auth.password(profile.password()).succeeded()) {
+
+            // The key first when there is one, and the password as a fallback:
+            // a key that the server has not been given is a failed attempt, not
+            // a reason to give up on a connection the user can still make.
+            boolean authenticated = false;
+            if (profile.privateKey().length() > 0) {
+                canvas.setStatus("authenticating with the key...");
+                authenticated = auth.publicKey(
+                    OpenSshKey.readEd25519Seed(profile.privateKey())).succeeded();
+            }
+            if (!authenticated && profile.password().length() > 0) {
+                canvas.setStatus("authenticating with the password...");
+                authenticated = auth.password(profile.password()).succeeded();
+            }
+            if (!authenticated) {
                 fail("Authentication failed.");
                 return;
             }

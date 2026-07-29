@@ -59,6 +59,7 @@ public class ServerTests {
         rendersARealSessionThroughTheTerminal();
         survivesTypingWhileOutputArrives();
         survivesARekey();
+        authenticatesWithAKey();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -612,6 +613,64 @@ public class ServerTests {
 
             channel.write(Utf8.encode("exit\n"));
             channel.close();
+        } finally {
+            socket.close();
+        }
+    }
+
+    /**
+     * Public key authentication, end to end.
+     *
+     * The one part of the protocol that had never been confirmed: signing
+     * matches the RFC 8032 vectors and the server parses our request, but
+     * whether OpenSSH *accepts* the signature needs a key in an
+     * authorized_keys file. The throwaway server carries one — the RFC 8032
+     * test vector 3 seed, published in the RFC and used in this project's
+     * crypto vectors, which secures nothing.
+     */
+    private static void authenticatesWithAKey() throws Exception {
+        Socket socket;
+        try {
+            socket = new Socket(host, rekeyPort);
+        } catch (IOException e) {
+            System.out.println("  SKIP  publickey: nothing on " + host + ":" + rekeyPort
+                + " (tools/rekey-server.sh)");
+            return;
+        }
+        try {
+            socket.setSoTimeout(20000);
+            EntropyPool random = new EntropyPool();
+            random.seed();
+            Connection connection = new Connection(
+                socket.getInputStream(), socket.getOutputStream(), random);
+            connection.handshake();
+
+            UserAuth auth = new UserAuth(connection, user);
+            auth.begin();
+            auth.queryMethods();
+
+            byte[] seed = hex("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7");
+            checkTrue("OpenSSH accepts a signature we made", auth.publicKey(seed).succeeded());
+
+            // And a key the server has not been given must be refused, or the
+            // test above would prove only that the server accepts anything.
+            Socket second = new Socket(host, rekeyPort);
+            try {
+                second.setSoTimeout(20000);
+                EntropyPool r2 = new EntropyPool();
+                r2.seed();
+                Connection c2 = new Connection(
+                    second.getInputStream(), second.getOutputStream(), r2);
+                c2.handshake();
+                UserAuth a2 = new UserAuth(c2, user);
+                a2.begin();
+                a2.queryMethods();
+                byte[] other =
+                    hex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+                checkTrue("an unauthorised key is refused", !a2.publicKey(other).succeeded());
+            } finally {
+                second.close();
+            }
         } finally {
             socket.close();
         }

@@ -30,7 +30,19 @@ public final class Profile {
         void delete(String name) throws IOException;
     }
 
-    private static final int FORMAT = 1;
+    /**
+     * Records written before the private key and font size existed say 1.
+     * Both are read, so adding fields does not throw away what is saved — a
+     * connection list that empties itself on upgrade is worse than the feature
+     * is worth.
+     */
+    private static final int FORMAT = 2;
+    private static final int FORMAT_WITHOUT_KEY = 1;
+
+    /** Cell sizes the atlases exist for, and what they give on a 480x360 screen. */
+    public static final int[] CELL_WIDTHS = { 8, 6, 6 };
+    public static final int[] CELL_HEIGHTS = { 14, 11, 9 };
+    public static final String[] SIZE_LABELS = { "8x14 (60 cols)", "6x11 (80 cols)", "6x9 (80 cols)" };
 
     private final String name;
     private final String host;
@@ -38,15 +50,24 @@ public final class Profile {
     private final String user;
     private final String password;
     private final boolean savePassword;
+    private final String privateKey;
+    private final int fontSize;
 
     public Profile(String name, String host, int port, String user,
                    String password, boolean savePassword) {
+        this(name, host, port, user, password, savePassword, "", 0);
+    }
+
+    public Profile(String name, String host, int port, String user, String password,
+                   boolean savePassword, String privateKey, int fontSize) {
         this.name = name;
         this.host = host;
         this.port = port;
         this.user = user;
         this.password = password == null ? "" : password;
         this.savePassword = savePassword;
+        this.privateKey = privateKey == null ? "" : privateKey;
+        this.fontSize = (fontSize < 0 || fontSize >= CELL_WIDTHS.length) ? 0 : fontSize;
     }
 
     public String name() {
@@ -74,6 +95,28 @@ public final class Profile {
         return savePassword;
     }
 
+    /** An OpenSSH private key, as pasted, or empty. */
+    public String privateKey() {
+        return privateKey;
+    }
+
+    /** An index into {@link #CELL_WIDTHS}. */
+    public int fontSize() {
+        return fontSize;
+    }
+
+    public int cellWidth() {
+        return CELL_WIDTHS[fontSize];
+    }
+
+    public int cellHeight() {
+        return CELL_HEIGHTS[fontSize];
+    }
+
+    public String fontResource() {
+        return "/fonts/mono" + cellWidth() + "x" + cellHeight() + ".png";
+    }
+
     /** What the connection list shows: enough to tell two servers apart. */
     public String label() {
         String where = user + "@" + host;
@@ -99,17 +142,19 @@ public final class Profile {
         w.writeString(Utf8.encode(user));
         w.writeBoolean(savePassword);
         w.writeString(Utf8.encode(savePassword ? password : ""));
+        w.writeString(Utf8.encode(privateKey));
+        w.writeUint32(fontSize);
         return w.toByteArray();
     }
 
     public static Profile decode(byte[] record) throws IOException {
         WireReader r = new WireReader(record);
         long format = r.readUint32();
-        if (format != FORMAT) {
-            // A record written by a version that is not this one. Refusing it
-            // is better than reading its fields in the wrong order.
+        if (format != FORMAT && format != FORMAT_WITHOUT_KEY) {
+            // A record from a version that is not one of ours. Refusing it is
+            // better than reading its fields in the wrong order.
             throw new SshException("saved connection is in format " + format
-                + ", not " + FORMAT);
+                + ", not " + FORMAT_WITHOUT_KEY + " or " + FORMAT);
         }
         String name = Utf8.decode(r.readString());
         String host = Utf8.decode(r.readString());
@@ -117,6 +162,14 @@ public final class Profile {
         String user = Utf8.decode(r.readString());
         boolean savePassword = r.readBoolean();
         String password = Utf8.decode(r.readString());
-        return new Profile(name, host, port, user, password, savePassword);
+
+        String privateKey = "";
+        int fontSize = 0;
+        if (format == FORMAT) {
+            privateKey = Utf8.decode(r.readString());
+            fontSize = (int) r.readUint32();
+        }
+        return new Profile(name, host, port, user, password, savePassword,
+            privateKey, fontSize);
     }
 }
