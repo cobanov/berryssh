@@ -323,6 +323,80 @@ public final class Ed25519 {
         return false;   // equal to L is not below it
     }
 
+    /** The 32-byte seed an OpenSSH ed25519 private key stores. */
+    public static final int SEED_LENGTH = 32;
+
+    /**
+     * Expands a 32-byte seed into the scalar and the prefix RFC 8032 section
+     * 5.1.5 derives from it.
+     *
+     * The pruning is not optional and not cosmetic: clearing the low three bits
+     * puts the scalar in the prime-order subgroup, and forcing bit 254 fixes
+     * its length so that a variable-time ladder cannot leak it.
+     */
+    private static byte[] expandSeed(byte[] seed) {
+        byte[] h = SHA512.hash(seed);
+        h[0] &= (byte) 248;
+        h[31] &= (byte) 127;
+        h[31] |= (byte) 64;
+        return h;
+    }
+
+    /** Derives the public key from a 32-byte seed. */
+    public static byte[] publicKey(byte[] seed) {
+        if (seed == null || seed.length != SEED_LENGTH) {
+            throw new IllegalArgumentException("seed must be " + SEED_LENGTH + " bytes");
+        }
+        byte[] h = expandSeed(seed);
+        byte[] a = new byte[32];
+        System.arraycopy(h, 0, a, 0, 32);
+        return compress(scalarMult(BASE, a, 255));
+    }
+
+    /**
+     * Signs a message with a 32-byte seed, per RFC 8032 section 5.1.6.
+     *
+     * Ed25519 signatures are deterministic: the per-signature nonce comes from
+     * hashing the message under the second half of the expanded seed rather
+     * than from a random source. That is a property worth having on this
+     * hardware in particular — a handset has very little entropy, and a
+     * signature scheme that leaks its key when the nonce repeats would be the
+     * worst possible consumer of it.
+     *
+     * @param seed 32 bytes, the private key as OpenSSH stores it
+     * @return 64 bytes: R followed by S
+     */
+    public static byte[] sign(byte[] seed, byte[] message) {
+        if (seed == null || seed.length != SEED_LENGTH) {
+            throw new IllegalArgumentException("seed must be " + SEED_LENGTH + " bytes");
+        }
+        byte[] h = expandSeed(seed);
+        byte[] a = new byte[32];
+        System.arraycopy(h, 0, a, 0, 32);
+
+        byte[] publicKey = compress(scalarMult(BASE, a, 255));
+
+        SHA512 nonce = new SHA512();
+        nonce.update(h, 32, 32);
+        nonce.update(message, 0, message.length);
+        byte[] r = ScalarModL.reduce(nonce.digest());
+
+        byte[] rPoint = compress(scalarMult(BASE, r, 253));
+
+        SHA512 challenge = new SHA512();
+        challenge.update(rPoint, 0, 32);
+        challenge.update(publicKey, 0, 32);
+        challenge.update(message, 0, message.length);
+        byte[] k = ScalarModL.reduce(challenge.digest());
+
+        byte[] s = ScalarModL.mulAdd(k, a, r);
+
+        byte[] signature = new byte[SIGNATURE_LENGTH];
+        System.arraycopy(rPoint, 0, signature, 0, 32);
+        System.arraycopy(s, 0, signature, 32, 32);
+        return signature;
+    }
+
     /**
      * Verifies a signature over a message.
      *

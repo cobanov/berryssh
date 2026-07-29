@@ -1,6 +1,7 @@
 import berryssh.crypto.ChaCha20;
 import berryssh.crypto.EntropyPool;
 import berryssh.crypto.Poly1305;
+import berryssh.crypto.ScalarModL;
 import berryssh.crypto.Ed25519;
 import berryssh.crypto.SHA256;
 import berryssh.crypto.SHA512;
@@ -26,6 +27,7 @@ public class CryptoTests {
         x25519Vectors();
         sha512Vectors();
         ed25519Vectors();
+        ed25519SigningVectors();
         entropyPoolVectors();
 
         System.out.println();
@@ -277,6 +279,81 @@ public class CryptoTests {
         for (int i = 0; i < 8; i++) {
             b[off + i] = (byte) (v >>> (8 * i));
         }
+    }
+
+    /**
+     * RFC 8032 section 7.1 again, from the other side. Signing has to reproduce
+     * the published signatures exactly — Ed25519 is deterministic, so there is
+     * one right answer per key and message and no tolerance anywhere in it.
+     *
+     * These also exercise the mod-L arithmetic that only signing needs. A fault
+     * in the reduction gives a signature that is wrong but well formed, which
+     * nothing but a known answer would catch.
+     */
+    private static void ed25519SigningVectors() {
+        String[][] vectors = {
+            // seed, public key, message, signature
+            { "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+              "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+              "",
+              "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+                + "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b" },
+            { "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+              "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+              "72",
+              "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+                + "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00" },
+            { "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+              "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025",
+              "af82",
+              "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac"
+                + "18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a" }
+        };
+
+        for (int i = 0; i < vectors.length; i++) {
+            byte[] seed = hex(vectors[i][0]);
+            byte[] message = hex(vectors[i][2]);
+            check("Ed25519 public key from seed, RFC 8032 TEST " + (i + 1),
+                Ed25519.publicKey(seed), vectors[i][1]);
+            check("Ed25519 signature, RFC 8032 TEST " + (i + 1),
+                Ed25519.sign(seed, message), vectors[i][3]);
+        }
+
+        // The two halves have to agree with each other as well as with the RFC,
+        // across a message long enough to span several hash blocks.
+        byte[] seed = hex("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7");
+        byte[] longMessage = new byte[1000];
+        for (int i = 0; i < longMessage.length; i++) {
+            longMessage[i] = (byte) (i * 7);
+        }
+        byte[] signature = Ed25519.sign(seed, longMessage);
+        checkTrue("a signature we produced verifies under the key we derived",
+            Ed25519.verify(Ed25519.publicKey(seed), longMessage, signature));
+
+        byte[] tampered = new byte[longMessage.length];
+        System.arraycopy(longMessage, 0, tampered, 0, longMessage.length);
+        tampered[500] ^= 0x01;
+        checkTrue("that signature does not verify over a changed message",
+            !Ed25519.verify(Ed25519.publicKey(seed), tampered, signature));
+
+        // Mod-L arithmetic on its own. L reduces to zero, and L-1 is unchanged:
+        // the two cases either side of the boundary the reduction turns on.
+        byte[] order = hex("edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010");
+        check("L reduces to zero", ScalarModL.reduce(order), repeat("00", 32));
+        byte[] orderMinusOne = hex("ecd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010");
+        check("L-1 is left alone", ScalarModL.reduce(orderMinusOne),
+            "ecd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010");
+        check("L+1 reduces to one", ScalarModL.reduce(
+            hex("eed3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010")),
+            "01" + repeat("00", 31));
+    }
+
+    private static String repeat(String s, int times) {
+        StringBuffer sb = new StringBuffer(s.length() * times);
+        for (int i = 0; i < times; i++) {
+            sb.append(s);
+        }
+        return sb.toString();
     }
 
     /**

@@ -7,6 +7,7 @@ import berryssh.protocol.PacketCipher;
 import berryssh.protocol.Negotiation;
 import berryssh.protocol.SshException;
 import berryssh.protocol.Transport;
+import berryssh.protocol.Utf8;
 import berryssh.protocol.WireReader;
 import berryssh.protocol.WireWriter;
 
@@ -55,6 +56,7 @@ public class TransportTests {
         exchangeHashVectors();
         packetCipherVectors();
         encryptedFraming();
+        utf8Vectors();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -617,9 +619,12 @@ public class TransportTests {
                 byte[] wire = sink.toByteArray();
 
                 // The encrypted run between the length field and the tag is
-                // what has to be a whole number of blocks.
+                // what has to be a whole number of blocks. RFC 4253's 16-byte
+                // floor does not apply here — it exists for block ciphers, and
+                // OpenSSH sends an 8-byte body for a one-byte message, so
+                // requiring more would reject a real server's packets.
                 int encrypted = wire.length - 4 - PacketCipher.TAG_LENGTH;
-                if (encrypted % 8 != 0 || wire.length < 16 + PacketCipher.TAG_LENGTH) {
+                if (encrypted % 8 != 0 || encrypted < 8) {
                     allAligned = false;
                 }
 
@@ -648,6 +653,50 @@ public class TransportTests {
             new Transport(new ByteArrayInputStream(sink.toByteArray()),
                           new ByteArrayOutputStream()).readPacket();
         });
+    }
+
+    /**
+     * UTF-8, which RFC 4252 requires for usernames and passwords while the
+     * device's default encoding is ISO8859_1.
+     *
+     * The Turkish characters are the case that matters rather than an
+     * illustration: under ISO8859_1 they encode to one byte each and the server
+     * would compare the wrong bytes, reporting only that the login failed.
+     */
+    private static void utf8Vectors() {
+        check("UTF-8 ASCII is unchanged", Utf8.encode("bb"), "6262");
+
+        // U+00E7 U+011F U+0131 U+00F6 U+015F U+00FC — the six Turkish letters.
+        check("UTF-8 encodes the Turkish letters",
+            Utf8.encode("çğıöşü"),
+            "c3a7c49fc4b1c3b6c59fc3bc");
+        checkTrue("a Turkish password is 6 characters and 12 bytes",
+            "çğıöşü".length() == 6
+                && Utf8.encode("çğıöşü").length == 12);
+
+        check("UTF-8 encodes a three-byte code point", Utf8.encode("€"), "e282ac");
+        // U+1F600, which Java holds as a surrogate pair.
+        check("UTF-8 encodes a surrogate pair as one four-byte sequence",
+            Utf8.encode("😀"), "f09f9880");
+
+        String[] roundTrips = {
+            "", "bb", "çğıöşü", "€",
+            "😀", "karışık ASCII ve Türkçe"
+        };
+        boolean allRoundTripped = true;
+        for (int i = 0; i < roundTrips.length; i++) {
+            if (!roundTrips[i].equals(Utf8.decode(Utf8.encode(roundTrips[i])))) {
+                allRoundTripped = false;
+            }
+        }
+        checkTrue("UTF-8 round trips, including outside the basic plane", allRoundTripped);
+
+        // One bad byte should cost one character, not the session: this decodes
+        // terminal output, where throwing would be the wrong response.
+        checkTrue("a malformed byte becomes one replacement character",
+            "a�b".equals(Utf8.decode(hex("61ff62"))));
+        checkTrue("a truncated sequence at the end does not run off the array",
+            Utf8.decode(hex("61c3")).length() == 2);
     }
 
     private static byte[] slice(byte[] b, int offset, int length) {
