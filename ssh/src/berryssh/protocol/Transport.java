@@ -42,6 +42,8 @@ public final class Transport {
     /** Smallest legal packet, counting the length field itself. */
     private static final int MIN_PACKET = 16;
 
+    private static final int LENGTH_FIELD = 4;
+
     private final InputStream in;
     private final OutputStream out;
 
@@ -58,6 +60,14 @@ public final class Transport {
      * cipher's block size, or 8 for a stream cipher and for the null cipher.
      */
     private int blockSize = 8;
+
+    /**
+     * Null until NEWKEYS. The two directions are separate because NEWKEYS is
+     * itself directional: our packets become encrypted when we send ours, and
+     * the server's when it sends its own, and those are not the same moment.
+     */
+    private PacketCipher outgoing;
+    private PacketCipher incoming;
 
     private String clientVersion;
     private String serverVersion;
@@ -85,6 +95,16 @@ public final class Transport {
 
     public long receiveSequence() {
         return receiveSequence;
+    }
+
+    /** Takes effect from the next packet we send. Call it straight after sending NEWKEYS. */
+    public void encryptOutgoing(PacketCipher cipher) {
+        this.outgoing = cipher;
+    }
+
+    /** Takes effect from the next packet we read. Call it straight after reading NEWKEYS. */
+    public void decryptIncoming(PacketCipher cipher) {
+        this.incoming = cipher;
     }
 
     /**
@@ -130,52 +150,90 @@ public final class Transport {
      * with at least 4 bytes of padding and at least 16 bytes in total.
      */
     public void writePacket(byte[] payload) throws IOException {
-        int unpadded = 5 + payload.length;
-        int padLength = blockSize - (unpadded % blockSize);
-        if (padLength < 4) {
-            padLength += blockSize;
+        byte[] body = pad(payload);
+        if (outgoing == null) {
+            byte[] packet = new byte[4 + body.length];
+            packet[0] = (byte) (body.length >>> 24);
+            packet[1] = (byte) (body.length >>> 16);
+            packet[2] = (byte) (body.length >>> 8);
+            packet[3] = (byte) body.length;
+            System.arraycopy(body, 0, packet, 4, body.length);
+            out.write(packet, 0, packet.length);
+        } else {
+            byte[] sealed = outgoing.seal(sendSequence, body);
+            out.write(sealed, 0, sealed.length);
         }
-        while (unpadded + padLength < MIN_PACKET) {
-            padLength += blockSize;
-        }
-
-        int packetLength = 1 + payload.length + padLength;
-        byte[] packet = new byte[4 + packetLength];
-        packet[0] = (byte) (packetLength >>> 24);
-        packet[1] = (byte) (packetLength >>> 16);
-        packet[2] = (byte) (packetLength >>> 8);
-        packet[3] = (byte) packetLength;
-        packet[4] = (byte) padLength;
-        System.arraycopy(payload, 0, packet, 5, payload.length);
-        fillRandom(packet, 5 + payload.length, padLength);
-
-        out.write(packet, 0, packet.length);
         out.flush();
         sendSequence = (sendSequence + 1) & 0xffffffffL;
     }
 
+    /**
+     * Builds the padding-length byte, the payload and the padding.
+     *
+     * The alignment rule changes once the AEAD is in play. RFC 4253 counts the
+     * length field towards the block multiple; chacha20-poly1305 encrypts that
+     * field separately with its own key, so it is not part of the aligned run
+     * and is excluded here. Getting this wrong yields packets a server rejects
+     * as corrupt with no indication that padding is what it is objecting to.
+     */
+    private byte[] pad(byte[] payload) {
+        int aligned = 1 + payload.length + (outgoing == null ? LENGTH_FIELD : 0);
+        int padLength = blockSize - (aligned % blockSize);
+        if (padLength < 4) {
+            padLength += blockSize;
+        }
+        while (LENGTH_FIELD + 1 + payload.length + padLength < MIN_PACKET) {
+            padLength += blockSize;
+        }
+
+        byte[] body = new byte[1 + payload.length + padLength];
+        body[0] = (byte) padLength;
+        System.arraycopy(payload, 0, body, 1, payload.length);
+        fillRandom(body, 1 + payload.length, padLength);
+        return body;
+    }
+
     /** Reads one packet and returns its payload. */
     public byte[] readPacket() throws IOException {
-        byte[] header = new byte[4];
-        readFully(header, 0, 4);
-        long packetLength = ((long) (header[0] & 0xff) << 24)
-                          | ((long) (header[1] & 0xff) << 16)
-                          | ((long) (header[2] & 0xff) << 8)
-                          | (long) (header[3] & 0xff);
+        byte[] header = new byte[LENGTH_FIELD];
+        readFully(header, 0, LENGTH_FIELD);
 
-        // Every check here happens before the allocation on the next line.
-        if (packetLength < MIN_PACKET - 4) {
+        long packetLength;
+        if (incoming == null) {
+            packetLength = ((long) (header[0] & 0xff) << 24)
+                         | ((long) (header[1] & 0xff) << 16)
+                         | ((long) (header[2] & 0xff) << 8)
+                         | (long) (header[3] & 0xff);
+        } else {
+            // Decrypted, but not yet authenticated — the tag covers this field
+            // and has not been checked. It is only trusted enough to decide how
+            // many bytes to read, and it is bounded before anything is
+            // allocated on the strength of it.
+            packetLength = incoming.peekLength(receiveSequence, header);
+        }
+
+        int alignment = incoming == null ? LENGTH_FIELD : 0;
+        if (packetLength < MIN_PACKET - LENGTH_FIELD) {
             throw new SshException("packet of " + packetLength + " bytes is below the minimum");
         }
         if (packetLength > MAX_PACKET) {
             throw new SshException("packet of " + packetLength + " bytes is implausible");
         }
-        if ((packetLength + 4) % blockSize != 0) {
+        if ((packetLength + alignment) % blockSize != 0) {
             throw new SshException("packet is not a whole number of " + blockSize + "-byte blocks");
         }
 
-        byte[] body = new byte[(int) packetLength];
-        readFully(body, 0, body.length);
+        byte[] body;
+        if (incoming == null) {
+            body = new byte[(int) packetLength];
+            readFully(body, 0, body.length);
+        } else {
+            byte[] encrypted = new byte[(int) packetLength];
+            readFully(encrypted, 0, encrypted.length);
+            byte[] tag = new byte[PacketCipher.TAG_LENGTH];
+            readFully(tag, 0, tag.length);
+            body = incoming.open(receiveSequence, header, encrypted, tag);
+        }
 
         int padLength = body[0] & 0xff;
         if (padLength < 4 || padLength > body.length - 1) {
