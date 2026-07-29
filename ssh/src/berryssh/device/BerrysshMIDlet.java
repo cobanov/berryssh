@@ -25,6 +25,7 @@ import berryssh.protocol.KnownHosts;
 import berryssh.protocol.OpenSshKey;
 import berryssh.protocol.UserAuth;
 import berryssh.protocol.Utf8;
+import berryssh.protocol.WebSocket;
 import berryssh.terminal.BitmapFont;
 import berryssh.terminal.VT320;
 
@@ -82,7 +83,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
 
     private static final String[] FIELDS = {
         "Name", "Host", "Port", "User", "Password", "Save password",
-        "Private key", "Terminal size"
+        "Private key", "Terminal size", "WebSocket path"
     };
 
     private Display display;
@@ -99,6 +100,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     private boolean editSavePassword;
     private String editKey = "";
     private int editFontSize;
+    private String editWsPath = "";
     private int editingField = -1;
 
     private TextBox entry;
@@ -332,6 +334,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         editSavePassword = profile != null && profile.savePassword();
         editKey = profile == null ? "" : profile.privateKey();
         editFontSize = profile == null ? 0 : profile.fontSize();
+        editWsPath = profile == null ? "" : profile.webSocketPath();
 
         if (editor == null) {
             editor = new ListScreen("Connection", new ListScreen.Listener() {
@@ -360,7 +363,8 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             editPassword.length() > 0 ? "set" : "not set",
             editSavePassword ? "yes  (stored unencrypted)" : "no",
             editKey.length() > 0 ? "set" : "not set  (paste id_ed25519)",
-            Profile.SIZE_LABELS[editFontSize]
+            Profile.SIZE_LABELS[editFontSize],
+            editWsPath.length() > 0 ? editWsPath : "not used  (plain socket)"
         };
         String[] names = new String[FIELDS.length];
         for (int i = 0; i < FIELDS.length; i++) {
@@ -404,6 +408,8 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             case 3: value = editUser; size = 32;
                     constraints = TextField.EMAILADDR | TextField.NON_PREDICTIVE; break;
             case 4: value = editPassword; size = 64; constraints = TextField.PASSWORD; break;
+            case 8: value = editWsPath; size = 128;
+                    constraints = TextField.URL | TextField.NON_PREDICTIVE; break;
             default: value = editKey; size = 2048; constraints = TextField.ANY; break;
         }
 
@@ -422,6 +428,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             case 2: editPort = value.trim(); break;
             case 3: editUser = value.trim(); break;
             case 4: editPassword = value; break;
+            case 8: editWsPath = value.trim(); break;
             default: editKey = value.trim(); break;
         }
         editingField = -1;
@@ -450,7 +457,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         }
 
         Profile profile = new Profile(name, editHost, parsePort(editPort), editUser,
-            editPassword, editSavePassword, editKey, editFontSize);
+            editPassword, editSavePassword, editKey, editFontSize, editWsPath);
         try {
             // Renaming replaces rather than duplicating.
             if (editingName != null && !editingName.equals(name)) {
@@ -530,6 +537,18 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             socket = openSocket(host, port);
             InputStream in = socket.openInputStream();
             OutputStream out = socket.openOutputStream();
+
+            // When a path is set the socket is only carrying HTTP, and what
+            // SSH actually runs on is the WebSocket inside it. Connection
+            // cannot tell the difference, which is the point of it taking
+            // streams rather than a socket.
+            if (profile.usesWebSocket()) {
+                canvas.setStatus("upgrading to a WebSocket...");
+                WebSocket ws = WebSocket.connect(in, out, host + ":" + port,
+                    profile.webSocketPath(), random);
+                in = ws.inputStream();
+                out = ws.outputStream();
+            }
 
             Connection connection = new Connection(in, out, random);
             HostKey key = connection.handshake();

@@ -178,6 +178,7 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
 - [x] Runs on a Bold 9790: connects, authenticates, opens a shell
 - [x] Saved connections, host key confirmation, and a transport two threads can share
 - [x] Screens drawn rather than left to MIDP's own forms
+- [x] SSH over a WebSocket, for a network whose only entrance speaks HTTP
 - [ ] Keyboard mapping confirmed against the hardware's real key codes
 
 ## Prior art

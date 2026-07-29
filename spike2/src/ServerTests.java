@@ -8,6 +8,7 @@ import berryssh.protocol.Message;
 import berryssh.protocol.Negotiation;
 import berryssh.protocol.Transport;
 import berryssh.protocol.UserAuth;
+import berryssh.protocol.WebSocket;
 import berryssh.protocol.Utf8;
 import berryssh.terminal.VT320;
 
@@ -60,6 +61,7 @@ public class ServerTests {
         survivesTypingWhileOutputArrives();
         survivesARekey();
         authenticatesWithAKey();
+        reachesAServerThroughAWebSocket();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -671,6 +673,70 @@ public class ServerTests {
             } finally {
                 second.close();
             }
+        } finally {
+            socket.close();
+        }
+    }
+
+    /**
+     * A full session carried inside a WebSocket.
+     *
+     * This is how the handset reaches a network whose only entrance speaks
+     * HTTP: it cannot run a VPN, and behind Cloudflare there is no raw TCP
+     * route to fall back on. The bridge on the far side turns the frames back
+     * into a socket.
+     *
+     * The bridge used here is written from RFC 6455 independently of the
+     * client, which is the point — a client tested against its own idea of the
+     * protocol proves nothing.
+     */
+    private static void reachesAServerThroughAWebSocket() throws Exception {
+        Socket socket;
+        try {
+            socket = new Socket(host, 8090);
+        } catch (IOException e) {
+            System.out.println("  SKIP  websocket: nothing on " + host + ":8090");
+            return;
+        }
+        try {
+            socket.setSoTimeout(20000);
+            EntropyPool random = new EntropyPool();
+            random.seed();
+
+            WebSocket ws = WebSocket.connect(socket.getInputStream(), socket.getOutputStream(),
+                host + ":8090", "/ssh", random);
+            checkTrue("the bridge upgrades the connection", ws != null);
+
+            // From here nothing knows it is not a socket, which is the whole
+            // reason Connection was built to take streams.
+            Connection connection = new Connection(ws.inputStream(), ws.outputStream(), random);
+            HostKey key = connection.handshake();
+            checkTrue("the key exchange completes through the WebSocket",
+                "SHA256:9tqjakW/Ia6U4hT3VgAv8EXXCxC1d3ez9mr5qjVTRZs".equals(key.fingerprint()));
+
+            UserAuth auth = new UserAuth(connection, user);
+            auth.begin();
+            auth.queryMethods();
+            checkTrue("authentication works through the WebSocket",
+                auth.password(password).succeeded());
+
+            Channel channel = Channel.openSession(connection);
+            channel.requestPty("xterm", 60, 25);
+            channel.requestShell();
+            channel.write(Utf8.encode("echo thro''ugh-the-tunnel; exit\n"));
+
+            StringBuffer output = new StringBuffer();
+            byte[] buffer = new byte[4096];
+            for (;;) {
+                int n = channel.read(buffer, 0, buffer.length);
+                if (n < 0) {
+                    break;
+                }
+                output.append(Utf8.decode(buffer, 0, n));
+            }
+            checkTrue("a shell runs through the WebSocket",
+                output.toString().indexOf("through-the-tunnel") >= 0);
+            channel.close();
         } finally {
             socket.close();
         }
