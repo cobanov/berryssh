@@ -51,14 +51,10 @@ public final class WireReader {
              | (long) (buf[pos++] & 0xff);
     }
 
-    public long readUint64() throws IOException {
-        need(8);
-        long v = 0;
-        for (int i = 0; i < 8; i++) {
-            v = (v << 8) | (buf[pos++] & 0xff);
-        }
-        return v;
-    }
+    // There was a readUint64 here. No message this client handles carries one,
+    // so the only thing that ever called it was its own test — which made it
+    // look like a need rather than a completeness exercise. RFC 4251 still
+    // defines the type; if something ever needs it, it is eight lines.
 
     /** Reads bytes with no length prefix. */
     public byte[] readRaw(int length) throws IOException {

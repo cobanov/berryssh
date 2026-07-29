@@ -53,12 +53,10 @@ public final class WireWriter {
         buf[pos++] = (byte) v;
     }
 
-    public void writeUint64(long v) {
-        ensure(8);
-        for (int shift = 56; shift >= 0; shift -= 8) {
-            buf[pos++] = (byte) (v >>> shift);
-        }
-    }
+    // writeUint64 went with the matching reader. RFC 4251 defines the type and
+    // nothing this client sends or receives uses it, so the pair existed to
+    // make the wire-type set look complete and were exercised only by the test
+    // that proved they were symmetrical with each other.
 
     /** Appends bytes with no length prefix. */
     public void writeRaw(byte[] b) {

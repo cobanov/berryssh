@@ -58,23 +58,16 @@ public final class Profile {
     private final String bridgeKey;
     private final String bridgeTarget;
 
-    public Profile(String name, String host, int port, String user,
-                   String password, boolean savePassword) {
-        this(name, host, port, user, password, savePassword, "", 0, "");
-    }
-
-    public Profile(String name, String host, int port, String user, String password,
-                   boolean savePassword, String privateKey, int fontSize) {
-        this(name, host, port, user, password, savePassword, privateKey, fontSize, "");
-    }
-
-    public Profile(String name, String host, int port, String user, String password,
-                   boolean savePassword, String privateKey, int fontSize,
-                   String webSocketPath) {
-        this(name, host, port, user, password, savePassword, privateKey, fontSize,
-            webSocketPath, "", "");
-    }
-
+    /**
+     * There were three shorter constructors above this one. Only the tests
+     * reached them in the end, which meant the tests were exercising a shape
+     * the application never builds — and one of them had already caused a bug,
+     * when the password prompt used the eight-argument form and silently
+     * dropped the WebSocket path.
+     *
+     * A connection has these fields. Passing all of them is not a burden worth
+     * a convenience that can lose one.
+     */
     public Profile(String name, String host, int port, String user, String password,
                    boolean savePassword, String privateKey, int fontSize,
                    String webSocketPath, String bridgeKey, String bridgeTarget) {
