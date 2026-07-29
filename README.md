@@ -65,6 +65,21 @@ them without needing a native preverifier binary.
 
 ## Installing
 
+The current build is served over plain HTTP at
+**http://berryssh.cobanov.run/** — open it in the handset's own browser.
+
+Plain HTTP is not laziness. An OS 7.1 browser offers TLS 1.0 at best and its
+trust store predates every currently issued CA, so a modern edge cannot serve
+it at all: `cobanov.dev` refuses TLS 1.0 and 1.1 outright, and redirects HTTP
+to HTTPS, which makes it unreachable from this device no matter what is behind
+it. `cobanov.run` does not redirect, which is the whole reason it is the host.
+
+`tools/deploy.md` describes how that is wired: releases hold the artifacts, and
+a small Worker fronts them with the two MIME types the device needs — a
+descriptor served as anything else is displayed as text rather than installed,
+with no error to explain it.
+
+
 `tools/ota_server.py` serves a build with the MIME types the device requires — a
 generic static server renders the descriptor as text instead of installing it.
 Plain HTTP is deliberate: the OS 7 browser's trust store predates every
