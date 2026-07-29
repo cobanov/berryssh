@@ -1,3 +1,4 @@
+import berryssh.device.Profile;
 import berryssh.protocol.Ascii;
 import berryssh.protocol.Base64;
 import berryssh.protocol.HostKey;
@@ -59,6 +60,7 @@ public class TransportTests {
         encryptedFraming();
         utf8Vectors();
         knownHostsPolicy();
+        savedConnections();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -755,6 +757,58 @@ public class TransportTests {
         public void store(String host, int port, byte[] blob) {
             entries.put(host + ":" + port, blob);
         }
+    }
+
+    /**
+     * Saved connections, on the encoding side.
+     *
+     * The store itself is RMS and only exists on the device, so what is worth
+     * testing here is what goes into a record and what comes back out.
+     */
+    private static void savedConnections() {
+        try {
+            Profile full = new Profile("work", "example.org", 2222, "cobanov", "sifre", true);
+            Profile back = Profile.decode(full.encode());
+            checkTrue("a saved connection round trips",
+                "work".equals(back.name())
+                    && "example.org".equals(back.host())
+                    && back.port() == 2222
+                    && "cobanov".equals(back.user())
+                    && "sifre".equals(back.password())
+                    && back.savePassword());
+
+            // The password is left out of the record rather than written and
+            // hidden behind a flag: a flag protects nobody who reads the record.
+            Profile unsaved = new Profile("home", "example.org", 22, "bb", "secret", false);
+            Profile storedUnsaved = Profile.decode(unsaved.encode());
+            checkTrue("a password that was not to be saved is not in the record",
+                storedUnsaved.password().length() == 0 && !storedUnsaved.savePassword());
+            checkTrue("the unsaved password is absent from the bytes",
+                toHex(unsaved.encode()).indexOf(toHex(Ascii.toBytes("secret"))) < 0);
+
+            // UTF-8 throughout: the device's default encoding would mangle both
+            // of these, and neither is hypothetical for this user.
+            Profile turkish = new Profile("işyeri", "sunucu.example.org", 22,
+                "çağrı", "parolağı", true);
+            Profile turkishBack = Profile.decode(turkish.encode());
+            checkTrue("Turkish characters survive a save and a load",
+                "işyeri".equals(turkishBack.name())
+                    && "çağrı".equals(turkishBack.user())
+                    && "parolağı".equals(turkishBack.password()));
+
+            checkTrue("the list label identifies the server",
+                full.label().indexOf("cobanov@example.org:2222") >= 0);
+            checkTrue("the default port is left out of the label",
+                new Profile("", "example.org", 22, "bb", "", false)
+                    .label().indexOf(":22") < 0);
+        } catch (IOException e) {
+            fail("saved connection round trip threw " + e);
+        }
+
+        // A record from a version that is not this one is refused rather than
+        // read with its fields in the wrong order.
+        checkRejected("a saved connection in an unknown format is refused",
+            () -> Profile.decode(hex("0000009900000000")));
     }
 
     private static byte[] slice(byte[] b, int offset, int length) {
