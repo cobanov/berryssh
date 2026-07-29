@@ -43,6 +43,8 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
 
     private final Command connect = new Command("Connect", Command.OK, 1);
     private final Command quit = new Command("Quit", Command.EXIT, 2);
+    private final Command acceptKey = new Command("Accept", Command.OK, 1);
+    private final Command rejectKey = new Command("Reject", Command.CANCEL, 2);
     private final Command control = new Command("Ctrl", Command.SCREEN, 1);
     private final Command escape = new Command("Esc", Command.SCREEN, 2);
     private final Command keys = new Command("Keys", Command.SCREEN, 3);
@@ -68,6 +70,16 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     private Channel channel;
     private volatile boolean running;
     private boolean fullScreenOn;
+
+    /**
+     * How the session thread asks the user something and waits for the answer.
+     *
+     * The prompt has to be raised on one thread and answered on another, and
+     * the connection cannot proceed until it is — which is the whole point of a
+     * confirmation.
+     */
+    private final Object promptLock = new Object();
+    private Boolean promptAnswer;
 
     protected void startApp() {
         if (display != null) {
@@ -151,6 +163,14 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             startSession();
             return;
         }
+        if (command == acceptKey || command == rejectKey) {
+            synchronized (promptLock) {
+                promptAnswer = (command == acceptKey) ? Boolean.TRUE : Boolean.FALSE;
+                promptLock.notifyAll();
+            }
+            display.setCurrent(canvas);
+            return;
+        }
         if (command == disconnect) {
             shutdown();
             display.setCurrent(setup);
@@ -221,9 +241,16 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
                 return;
             }
             if (trust == KnownHosts.UNKNOWN) {
-                // Trust on first use. The fingerprint is shown in the form
-                // ssh-keygen prints so it can actually be compared.
-                canvas.setStatus(key.fingerprint());
+                // Trust on first use means the user does the trusting. Showing
+                // the fingerprint and carrying on regardless is trust without
+                // use: a machine in the path on this first connection would be
+                // accepted silently, and its key stored — so every later
+                // connection to the real server would raise a mismatch and the
+                // impostor would be the one that looked legitimate.
+                if (!ask("Unknown host", KnownHosts.firstContactPrompt(host, port, key))) {
+                    fail("Host key rejected. Nothing was stored.");
+                    return;
+                }
                 KnownHosts.accept(hostKeys, host, port, key);
             }
 
@@ -333,6 +360,33 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
      * the read fails by design. Showing that as an error would put a warning in
      * front of a user who just chose to leave.
      */
+    /**
+     * Puts a question to the user and blocks until it is answered.
+     *
+     * Called from the session thread, never the event thread — waiting on the
+     * event thread would deadlock against the very screen being waited for.
+     */
+    private boolean ask(String title, String text) {
+        Form prompt = new Form(title);
+        prompt.append(text);
+        prompt.addCommand(acceptKey);
+        prompt.addCommand(rejectKey);
+        prompt.setCommandListener(this);
+
+        synchronized (promptLock) {
+            promptAnswer = null;
+            display.setCurrent(prompt);
+            while (promptAnswer == null) {
+                try {
+                    promptLock.wait();
+                } catch (InterruptedException e) {
+                    return false;
+                }
+            }
+            return promptAnswer.booleanValue();
+        }
+    }
+
     private void fail(final String message) {
         if (!running) {
             return;
