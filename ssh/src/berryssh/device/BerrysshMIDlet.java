@@ -169,8 +169,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         try {
             random.seed();
 
-            socket = (SocketConnection) Connector.open(
-                "socket://" + host + ":" + port, Connector.READ_WRITE);
+            socket = openSocket(host, port);
             InputStream in = socket.openInputStream();
             OutputStream out = socket.openOutputStream();
 
@@ -239,6 +238,44 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         } finally {
             closeQuietly();
         }
+    }
+
+    /**
+     * Opens a socket, trying each transport this device might mean by one.
+     *
+     * A plain `socket://host:port` is ambiguous on BlackBerry: the OS chooses a
+     * transport, and the default is the carrier's. On a handset in this decade
+     * that route is gone — BIS was switched off, and MDS needs an enterprise
+     * server — so the connection has to say Wi-Fi explicitly. The suffixes are
+     * URL parameters rather than an API, so they cost nothing in signing terms.
+     *
+     * They are tried in order rather than assumed, because which one a given
+     * OS 7 build accepts has not been established on the hardware here. The one
+     * that works is reported on the status line, so the first real connection
+     * also settles the question.
+     */
+    private SocketConnection openSocket(String host, int port) throws IOException {
+        String address = "socket://" + host + ":" + port;
+        String[] transports = {
+            ";deviceside=true;interface=wifi",   // direct TCP over Wi-Fi
+            ";deviceside=true",                  // direct TCP, whatever interface
+            ""                                   // whatever the OS defaults to
+        };
+
+        IOException last = null;
+        for (int i = 0; i < transports.length; i++) {
+            try {
+                canvas.setStatus("connecting" + transports[i]);
+                SocketConnection open = (SocketConnection)
+                    Connector.open(address + transports[i], Connector.READ_WRITE);
+                canvas.setStatus("connected" + transports[i]);
+                return open;
+            } catch (IOException e) {
+                last = e;
+            }
+        }
+        throw new IOException("no transport reached " + host + ":" + port
+            + " (last error: " + (last == null ? "none" : last.getMessage()) + ")");
     }
 
     private void fail(final String message) {
