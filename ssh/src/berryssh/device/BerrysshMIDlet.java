@@ -271,7 +271,13 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
                 }
                 // The device's default encoding is ISO8859_1, so the decode is
                 // ours to do. See Utf8.
-                terminal.putString(Utf8.decode(buffer, 0, n));
+                // The painter reads this buffer from the event thread while
+                // this thread writes it. VT320 publishes a mutex for exactly
+                // that, and using it is the difference between a redraw during
+                // a scroll and an index off the end of an array being resized.
+                synchronized (terminal.getTermBufferMutex()) {
+                    terminal.putString(Utf8.decode(buffer, 0, n));
+                }
                 canvas.repaint();
             }
             canvas.setStatus("disconnected");

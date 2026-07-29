@@ -37,6 +37,15 @@ public final class Channel {
 
     private final Connection connection;
 
+    /**
+     * Guards the server's window, and is what a blocked writer waits on.
+     *
+     * The window is decremented by whoever is sending — the UI thread — and
+     * replenished by whoever is reading, so it is the one piece of channel
+     * state two threads genuinely share.
+     */
+    private final Object windowLock = new Object();
+
     private int remoteId;
     private long remoteWindow;
     private int remoteMaxPacket;
@@ -45,8 +54,8 @@ public final class Channel {
     private byte[] pending = new byte[0];
     private int pendingAt;
 
-    private boolean eof;
-    private boolean closed;
+    private volatile boolean eof;
+    private volatile boolean closed;
     private int exitStatus = -1;
 
     private Channel(Connection connection) {
@@ -144,25 +153,42 @@ public final class Channel {
      */
     public void write(byte[] data, int offset, int length) throws IOException {
         while (length > 0) {
-            while (remoteWindow == 0) {
-                // Nothing to do but read: only the server can reopen its window.
-                pump();
-            }
-            int take = length;
-            if (take > remoteMaxPacket) {
-                take = remoteMaxPacket;
-            }
-            if (take > remoteWindow) {
-                take = (int) remoteWindow;
+            int take;
+            synchronized (windowLock) {
+                // Wait to be told the window opened; do not go and read for it.
+                // Reading here would put a second thread on the socket while
+                // the reader is already parked on it, and both would advance
+                // the receive sequence — so the nonces would diverge and
+                // nothing would decrypt from that point on.
+                while (remoteWindow == 0 && !closed) {
+                    try {
+                        windowLock.wait();
+                    } catch (InterruptedException e) {
+                        throw new SshException("interrupted waiting for the channel window");
+                    }
+                }
+                if (closed) {
+                    throw new SshException("the channel closed before the data could be sent");
+                }
+                take = length;
+                if (take > remoteMaxPacket) {
+                    take = remoteMaxPacket;
+                }
+                if (take > remoteWindow) {
+                    take = (int) remoteWindow;
+                }
+                remoteWindow -= take;
             }
 
+            // Sent outside the lock: writePacket serialises itself, and holding
+            // this one across a socket write would stall the reader's window
+            // updates behind it.
             WireWriter w = new WireWriter(take + 16);
             w.writeByte(Message.CHANNEL_DATA);
             w.writeUint32(remoteId);
             w.writeString(data, offset, take);
             connection.transport().writePacket(w.toByteArray());
 
-            remoteWindow -= take;
             offset += take;
             length -= take;
         }
@@ -225,14 +251,17 @@ public final class Channel {
     }
 
     public void close() throws IOException {
-        if (closed) {
-            return;
+        synchronized (windowLock) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            windowLock.notifyAll();
         }
         WireWriter w = new WireWriter(16);
         w.writeByte(Message.CHANNEL_CLOSE);
         w.writeUint32(remoteId);
         connection.transport().writePacket(w.toByteArray());
-        closed = true;
     }
 
     /** Reads and dispatches exactly one message. */
@@ -267,7 +296,11 @@ public final class Channel {
 
         if (type == Message.CHANNEL_WINDOW_ADJUST) {
             checkRecipient(r.readUint32());
-            remoteWindow += r.readUint32();
+            long more = r.readUint32();
+            synchronized (windowLock) {
+                remoteWindow += more;
+                windowLock.notifyAll();
+            }
             return;
         }
         if (type == Message.CHANNEL_EOF) {
@@ -275,7 +308,12 @@ public final class Channel {
             return;
         }
         if (type == Message.CHANNEL_CLOSE) {
-            closed = true;
+            // Waking any blocked writer matters as much as the flag: without
+            // it, a send that was waiting on the window waits for ever.
+            synchronized (windowLock) {
+                closed = true;
+                windowLock.notifyAll();
+            }
             return;
         }
         if (type == Message.CHANNEL_REQUEST) {

@@ -145,11 +145,18 @@ public final class TerminalCanvas extends Canvas {
             font.setColours(FOREGROUND, BACKGROUND);
             int columns = columns();
             int rows = rows();
-            for (int row = 0; row < rows; row++) {
-                for (int column = 0; column < columns; column++) {
-                    char c = terminal.getChar(column, row);
-                    if (c > 32) {
-                        font.drawChar(g, c, column * font.cellWidth(), row * font.cellHeight());
+            // Held across the whole screen rather than per character: the
+            // session thread must not scroll the buffer out from under a
+            // half-drawn frame, which would tear the picture and, during a
+            // resize, index past the end of it.
+            synchronized (terminal.getTermBufferMutex()) {
+                for (int row = 0; row < rows; row++) {
+                    for (int column = 0; column < columns; column++) {
+                        char c = terminal.getChar(column, row);
+                        if (c > 32) {
+                            font.drawChar(g, c,
+                                column * font.cellWidth(), row * font.cellHeight());
+                        }
                     }
                 }
             }
