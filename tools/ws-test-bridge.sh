@@ -28,15 +28,21 @@ fi
 
 # Points at the same container the rest of against-server.sh uses, so the
 # WebSocket path and the direct path are proved against the same server.
+#
+# The key is a fixture, not a secret: it is written here, committed, and
+# matches the constant in ServerTests. A bridge on loopback in front of a
+# throwaway container has nothing to protect — what is being tested is that the
+# key is demanded at all, and that a wrong one gets nothing.
 cat > "$CONFIG" <<'EOF'
 {
   "listen": 8090,
   "bind": "127.0.0.1",
+  "psk": "spike2-bridge-key-not-a-secret",
   "targets": {
-    "/ssh": ["127.0.0.1", 2222]
+    "testserver": ["127.0.0.1", 2222]
   }
 }
 EOF
 
-echo "==> bridge on $PORT -> 127.0.0.1:2222 (path /ssh)"
+echo "==> bridge on $PORT -> 127.0.0.1:2222 (target testserver, key required)"
 exec python3 tools/wsbridge.py "$CONFIG"

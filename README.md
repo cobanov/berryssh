@@ -105,14 +105,16 @@ spike2/run.sh
 **Crypto**: FIPS 180-4 for SHA-256 and SHA-512, RFC 8439 §2.4.2 / §2.5.2 /
 §2.8.2 for ChaCha20, Poly1305 and the AEAD construction, RFC 7748 §5.2 / §6.1
 for X25519, RFC 8032 §7.1 for Ed25519 in both directions, and the DRBG
-against vectors computed outside it. 49 in total.
+against vectors computed outside it, and RFC 4231 for HMAC-SHA-256. 58 in
+total.
 
 **Transport**: RFC 4251 §5 for the wire types, RFC 4253 §6 for the packet
 framing and §7.1 for algorithm negotiation, RFC 8731 §3 for the exchange hash
 and RFC 4253 §7.2 for key derivation, plus base64, host key parsing, the
 version exchange, the chacha20-poly1305 packet layer, UTF-8, host key trust,
-saved connections, OpenSSH private key files and the paths that have to
-reject malformed input. 112 in total. A further 39 cover the terminal: escape sequences, key dispatch,
+saved connections, OpenSSH private key files, the bridge handshake and every
+way it can be refused, and the paths that have to
+reject malformed input. 131 in total. A further 39 cover the terminal: escape sequences, key dispatch,
 scrollback and the character-to-glyph mapping. They run under a Turkish default locale, which is the device's own and
 the setting most likely to break protocol code without raising an error
 anywhere.
@@ -130,10 +132,11 @@ spike2/against-server.sh          # defaults to the project's container
 ```
 
 Each of those two covers something the shared container cannot: a rekey inside
-seconds instead of an hour, an authorised key, and an HTTP entrance to reach
-SSH through. When either is absent its tests print `SKIP` rather than passing
-quietly — a test that stops running without saying so is worse than one that
-fails.
+seconds instead of an hour, an authorised key, and an authenticating bridge to
+reach SSH through — including the two ways it must refuse, a wrong key and a
+machine that is not on its list. When either is absent its tests print `SKIP`
+rather than passing quietly — a test that stops running without saying so is
+worse than one that fails.
 
 It is a separate script so that `run.sh` needs nothing external. The container
 still offers the 2011 algorithms as well as the modern ones, which is what
