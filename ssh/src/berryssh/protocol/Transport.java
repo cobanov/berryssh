@@ -182,7 +182,12 @@ public final class Transport {
         if (padLength < 4) {
             padLength += blockSize;
         }
-        while (LENGTH_FIELD + 1 + payload.length + padLength < MIN_PACKET) {
+        // RFC 4253's 16-byte floor exists so a block cipher always gets a whole
+        // block. It does not apply to the AEAD, and OpenSSH does not apply it
+        // there either — padding to 16 anyway would put eight wasted bytes on
+        // every keystroke, on a link where that is the expensive direction.
+        while (outgoing == null
+                && LENGTH_FIELD + 1 + payload.length + padLength < MIN_PACKET) {
             padLength += blockSize;
         }
 
@@ -212,8 +217,13 @@ public final class Transport {
             packetLength = incoming.peekLength(receiveSequence, header);
         }
 
+        // The floor differs with the cipher for the same reason the padding
+        // does: under the AEAD the smallest legal body is one block holding the
+        // padding-length byte, a message type and four bytes of padding, and a
+        // real server sends exactly that for a one-byte message.
         int alignment = incoming == null ? LENGTH_FIELD : 0;
-        if (packetLength < MIN_PACKET - LENGTH_FIELD) {
+        int minimum = incoming == null ? MIN_PACKET - LENGTH_FIELD : blockSize;
+        if (packetLength < minimum) {
             throw new SshException("packet of " + packetLength + " bytes is below the minimum");
         }
         if (packetLength > MAX_PACKET) {

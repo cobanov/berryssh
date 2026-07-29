@@ -6,6 +6,7 @@ import berryssh.protocol.KeyExchange;
 import berryssh.protocol.Message;
 import berryssh.protocol.Negotiation;
 import berryssh.protocol.Transport;
+import berryssh.protocol.UserAuth;
 
 import java.io.IOException;
 import java.net.Socket;
@@ -27,6 +28,8 @@ public class ServerTests {
 
     private static String host = "127.0.0.1";
     private static int port = 2222;
+    private static String user = "bb";
+    private static String password = "bbssh";
 
     private static int passed;
     private static int failed;
@@ -38,11 +41,16 @@ public class ServerTests {
         if (args.length >= 2) {
             port = Integer.parseInt(args[1]);
         }
+        if (args.length >= 4) {
+            user = args[2];
+            password = args[3];
+        }
 
         System.out.println("  ..    against " + host + ":" + port);
         negotiatesWithRealServer();
         exchangesKeysWithRealServer();
         encryptsWithRealServer();
+        authenticatesWithRealServer();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -188,6 +196,83 @@ public class ServerTests {
         } finally {
             socket.close();
         }
+    }
+
+    /**
+     * RFC 4252 against the real server: what it will accept, a wrong password,
+     * a right one, and a publickey request it can parse.
+     */
+    private static void authenticatesWithRealServer() throws Exception {
+        Socket socket = new Socket(host, port);
+        try {
+            socket.setSoTimeout(15000);
+            EntropyPool random = new EntropyPool();
+            random.seed();
+            Connection connection = new Connection(
+                socket.getInputStream(), socket.getOutputStream(), random);
+            connection.handshake();
+
+            UserAuth auth = new UserAuth(connection, user);
+            auth.begin();
+
+            // "none" is not a way in; it is how you ask what the server wants,
+            // and its failure carries the answer.
+            UserAuth.Result none = auth.queryMethods();
+            checkTrue("the none method is refused and names what can continue",
+                !none.succeeded() && none.methodsThatCanContinue().length > 0);
+            System.out.println("        server accepts " + join(none.methodsThatCanContinue()));
+
+            boolean offersPassword = false;
+            boolean offersPublicKey = false;
+            for (int i = 0; i < none.methodsThatCanContinue().length; i++) {
+                String method = none.methodsThatCanContinue()[i];
+                if ("password".equals(method)) {
+                    offersPassword = true;
+                }
+                if ("publickey".equals(method)) {
+                    offersPublicKey = true;
+                }
+            }
+            checkTrue("the server offers password and publickey",
+                offersPassword && offersPublicKey);
+
+            // A publickey request the server can parse. This key is not in any
+            // authorized_keys, so the attempt must fail — what it demonstrates
+            // is that the request and key blob are well formed enough for the
+            // server to read the key out and name it in its log.
+            UserAuth.Result byKey = auth.publicKey(
+                hex("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7"));
+            checkTrue("an unauthorised publickey request is parsed and refused",
+                !byKey.succeeded() && byKey.methodsThatCanContinue().length > 0);
+
+            UserAuth.Result wrong = auth.password("not the password");
+            checkTrue("a wrong password is refused",
+                !wrong.succeeded() && !wrong.partialSuccess());
+
+            UserAuth.Result right = auth.password(password);
+            checkTrue("the right password is accepted", right.succeeded());
+        } finally {
+            socket.close();
+        }
+    }
+
+    private static String join(String[] names) {
+        StringBuffer sb = new StringBuffer();
+        for (int i = 0; i < names.length; i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(names[i]);
+        }
+        return sb.toString();
+    }
+
+    private static byte[] hex(String s) {
+        byte[] b = new byte[s.length() / 2];
+        for (int i = 0; i < b.length; i++) {
+            b[i] = (byte) Integer.parseInt(s.substring(2 * i, 2 * i + 2), 16);
+        }
+        return b;
     }
 
     private static boolean sameBytes(byte[] a, byte[] b) {
