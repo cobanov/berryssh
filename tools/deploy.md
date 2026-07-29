@@ -61,3 +61,24 @@ gh release create vX.Y.Z out/berryssh.jar out/berryssh.jad
 Then point the Worker's `RELEASE` constant at the new tag. The version in the
 descriptor must increase, or the device refuses the update as already
 installed — and says nothing about versions when it does.
+
+## The deploy is not finished when the upload returns
+
+Pointing `RELEASE` at a new tag does not take effect everywhere at once. During
+the 0.8.0 deploy the descriptor came back as 0.8.0 while the jar was still the
+0.7.0 one — a `MIDlet-Jar-Size` of 159327 against a jar of 157764, which is the
+silent install failure above, manufactured by the deploy rather than by a
+mistake in the build. It settled about a minute later.
+
+So check before treating a release as live, and check the two against each
+other rather than separately:
+
+```sh
+curl -s http://berryssh.cobanov.run/berryssh.jad          # note Jar-Size
+curl -s -o /tmp/dl.jar -w '%{size_download}\n' \
+  http://berryssh.cobanov.run/berryssh.jar                # must equal it
+shasum -a 256 /tmp/dl.jar out/berryssh.jar                # must be one hash
+```
+
+The last line is the one that matters: a size can match by coincidence, a
+SHA-256 of the artifact you actually built cannot. See #64.
