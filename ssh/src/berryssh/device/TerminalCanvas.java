@@ -28,6 +28,10 @@ public final class TerminalCanvas extends Canvas {
     private Keyboard keyboard;
     private String status = "";
 
+    private boolean shown;
+    private boolean showKeyCodes;
+    private String lastKey = "";
+
     public TerminalCanvas(BitmapFont font) {
         this.font = font;
         setFullScreenMode(true);
@@ -39,14 +43,75 @@ public final class TerminalCanvas extends Canvas {
         repaint();
     }
 
-    /** How many columns of this font fit the canvas. */
+    /**
+     * Blocks until the canvas is actually on screen.
+     *
+     * setCurrent is asynchronous and full-screen mode is not applied until the
+     * canvas is shown, so getWidth and getHeight are not to be trusted before
+     * this returns. Reading them early gave a zero height, hence a negative row
+     * count, hence a paint loop that never ran — a blank terminal under a
+     * status line that drew perfectly well.
+     */
+    public synchronized void awaitShown(long milliseconds) {
+        long deadline = System.currentTimeMillis() + milliseconds;
+        while (!shown) {
+            long left = deadline - System.currentTimeMillis();
+            if (left <= 0) {
+                return;
+            }
+            try {
+                wait(left);
+            } catch (InterruptedException e) {
+                return;
+            }
+        }
+    }
+
+    protected synchronized void showNotify() {
+        shown = true;
+        notifyAll();
+    }
+
+    protected void sizeChanged(int width, int height) {
+        synchronized (this) {
+            shown = true;
+            notifyAll();
+        }
+        repaint();
+    }
+
+    /**
+     * How many columns of this font fit the canvas.
+     *
+     * Never below one. A zero or negative grid is not a smaller terminal, it is
+     * a terminal that draws nothing, and it should not be reachable by
+     * arithmetic on a size that has not arrived yet.
+     */
     public int columns() {
-        return font.columnsIn(getWidth());
+        return atLeastOne(font.columnsIn(getWidth()));
     }
 
     /** Rows, less one kept for the status line. */
     public int rows() {
-        return font.rowsIn(getHeight()) - 1;
+        return atLeastOne(font.rowsIn(getHeight()) - 1);
+    }
+
+    private static int atLeastOne(int n) {
+        return n < 1 ? 1 : n;
+    }
+
+    /**
+     * Shows the raw code of each key pressed instead of the status message.
+     *
+     * This is the measurement issue #11 has been waiting for. MIDP guarantees
+     * nothing about what a BlackBerry sends for its own Escape, Menu, Symbol
+     * and Alt keys, and putting the readout in the app itself means the numbers
+     * can be read off the hardware in the place they matter rather than from a
+     * separate probe.
+     */
+    public void toggleKeyCodes() {
+        showKeyCodes = !showKeyCodes;
+        repaint();
     }
 
     public void setStatus(String message) {
@@ -78,7 +143,7 @@ public final class TerminalCanvas extends Canvas {
         // The status line carries the one piece of state the terminal itself
         // cannot show: whether the sticky Ctrl is armed. Without it, an armed
         // Ctrl is invisible until it swallows the next keystroke.
-        String line = status;
+        String line = showKeyCodes ? lastKey : status;
         if (keyboard != null && keyboard.controlPending()) {
             line = "^ " + line;
         }
@@ -102,9 +167,6 @@ public final class TerminalCanvas extends Canvas {
     }
 
     private void deliver(int keyCode) {
-        if (keyboard == null) {
-            return;
-        }
         int action = 0;
         try {
             action = getGameAction(keyCode);
@@ -113,7 +175,16 @@ public final class TerminalCanvas extends Canvas {
             // handset produces plenty it does not. The key is still a key.
             action = 0;
         }
-        keyboard.keyPressed(keyCode, action);
+
+        // Recorded before anything can go wrong with it, and whether or not
+        // there is a session yet: a key that produces no output is exactly the
+        // case this readout exists to explain.
+        lastKey = "key " + keyCode + " action " + action
+            + " grid " + columns() + "x" + rows();
+
+        if (keyboard != null) {
+            keyboard.keyPressed(keyCode, action);
+        }
         repaint();
     }
 }

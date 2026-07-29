@@ -45,7 +45,8 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     private final Command quit = new Command("Quit", Command.EXIT, 2);
     private final Command control = new Command("Ctrl", Command.SCREEN, 1);
     private final Command escape = new Command("Esc", Command.SCREEN, 2);
-    private final Command disconnect = new Command("Disconnect", Command.STOP, 3);
+    private final Command keys = new Command("Keys", Command.SCREEN, 3);
+    private final Command disconnect = new Command("Disconnect", Command.STOP, 4);
 
     private Display display;
     private Form setup;
@@ -121,6 +122,10 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             keyboard.sendEscape();
             return;
         }
+        if (command == keys) {
+            canvas.toggleKeyCodes();
+            return;
+        }
         if (command == disconnect) {
             shutdown();
             display.setCurrent(setup);
@@ -149,6 +154,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         canvas = new TerminalCanvas(font);
         canvas.addCommand(control);
         canvas.addCommand(escape);
+        canvas.addCommand(keys);
         canvas.addCommand(disconnect);
         canvas.setCommandListener(this);
         canvas.setStatus("connecting to " + host + "...");
@@ -201,6 +207,11 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             final Channel session = Channel.openSession(connection);
             channel = session;
 
+            // The canvas has to be on screen before its size means anything:
+            // setCurrent is asynchronous and full-screen mode only applies once
+            // it is shown. Asking too early returns a zero height, and the
+            // terminal is then told it has no rows.
+            canvas.awaitShown(5000);
             int columns = canvas.columns();
             int rows = canvas.rows();
             terminal = new VT320(columns, rows) {
@@ -216,7 +227,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             };
             keyboard = new Keyboard(terminal);
             canvas.attach(terminal, keyboard);
-            canvas.setStatus(user + "@" + host);
+            canvas.setStatus(user + "@" + host + "  " + columns + "x" + rows);
 
             session.requestPty("xterm", columns, rows);
             session.requestShell();
