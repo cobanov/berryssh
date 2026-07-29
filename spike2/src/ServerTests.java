@@ -62,6 +62,7 @@ public class ServerTests {
         survivesTypingWhileOutputArrives();
         survivesARekey();
         authenticatesWithAKey();
+        leavesPolitely();
         reachesAServerThroughAWebSocket();
         refusesAWrongBridgeKey();
 
@@ -750,6 +751,63 @@ public class ServerTests {
             checkTrue("a shell runs through the WebSocket",
                 output.toString().indexOf("through-the-tunnel") >= 0);
             channel.close();
+        } finally {
+            socket.close();
+        }
+    }
+
+    /**
+     * Leaving properly, RFC 4253 section 11.1.
+     *
+     * A malformed disconnect would not be obvious from our side — we close
+     * either way — so the check is that the server ends the stream without
+     * sending a DISCONNECT of its own. A server that objects to a packet says
+     * so before it goes, and that is the distinction being drawn.
+     *
+     * Messages already in flight are drained rather than treated as a reply.
+     * OpenSSH sends GLOBAL_REQUEST (hostkeys-00@openssh.com) the moment
+     * authentication succeeds, so it is on the wire before our disconnect
+     * arrives and says nothing about it. An earlier version of this test called
+     * that a failure, which made a correct disconnect look broken.
+     */
+    private static void leavesPolitely() throws Exception {
+        Socket socket = new Socket(host, port);
+        try {
+            socket.setSoTimeout(15000);
+            EntropyPool random = new EntropyPool();
+            random.seed();
+
+            Connection connection = new Connection(
+                socket.getInputStream(), socket.getOutputStream(), random);
+            connection.handshake();
+            UserAuth auth = new UserAuth(connection, user);
+            auth.begin();
+            auth.queryMethods();
+            checkTrue("authenticated before disconnecting",
+                auth.password(password).succeeded());
+
+            connection.transport().writeDisconnect(
+                Transport.DISCONNECT_BY_APPLICATION, "disconnected by the user");
+
+            String ending = null;
+            try {
+                // Bounded: a server that kept talking would be the failure, and
+                // this must not become the loop that finds out forever.
+                for (int i = 0; i < 8 && ending == null; i++) {
+                    connection.transport().readMessage();
+                }
+                ending = "the server was still sending after 8 messages";
+            } catch (IOException e) {
+                ending = e.getMessage() == null ? "" : e.getMessage();
+            }
+            // The stream must actually end. Accepting any IOException would let
+            // a disconnect that did nothing at all pass on the read timeout,
+            // which is the failure this test exists to catch. And "server
+            // disconnected" is what readMessage turns the server's own
+            // DISCONNECT into — the ending that means it objected.
+            checkTrue("the server accepts our disconnect and closes without complaint",
+                ending.indexOf("closed") >= 0
+                    && ending.indexOf("server disconnected") < 0);
         } finally {
             socket.close();
         }
