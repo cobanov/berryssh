@@ -122,7 +122,7 @@ and RFC 4253 §7.2 for key derivation, plus base64, host key parsing, the
 version exchange, the chacha20-poly1305 packet layer, UTF-8, host key trust,
 saved connections, OpenSSH private key files, the bridge handshake and every
 way it can be refused, and the paths that have to
-reject malformed input. 131 in total. A further 39 cover the terminal: escape sequences, key dispatch,
+reject malformed input. 129 in total. A further 39 cover the terminal: escape sequences, key dispatch,
 scrollback and the character-to-glyph mapping. They run under a Turkish default locale, which is the device's own and
 the setting most likely to break protocol code without raising an error
 anywhere.
