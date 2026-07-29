@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 
+import berryssh.crypto.Bytes;
 import berryssh.crypto.EntropyPool;
 
 /**
@@ -126,7 +127,7 @@ public final class Connection implements Transport.RekeyHandler {
             // The host key must still be the one already trusted. A server that
             // presents a different one mid-session is not the server we
             // authenticated to.
-            if (!sameBytes(hostKey.blob(), result.hostKey().blob())) {
+            if (!Bytes.equal(hostKey.blob(), result.hostKey().blob())) {
                 throw new SshException("the host key changed during a rekey");
             }
 
@@ -140,18 +141,6 @@ public final class Connection implements Transport.RekeyHandler {
             transport.decryptIncoming(new PacketCipher(
                 result.deriveKey('D', sessionId, PacketCipher.KEY_LENGTH)));
         }
-    }
-
-    private static boolean sameBytes(byte[] a, byte[] b) {
-        if (a == null || b == null || a.length != b.length) {
-            return false;
-        }
-        for (int i = 0; i < a.length; i++) {
-            if (a[i] != b[i]) {
-                return false;
-            }
-        }
-        return true;
     }
 
     /**

@@ -2,6 +2,8 @@ package berryssh.protocol;
 
 import java.io.IOException;
 
+import berryssh.crypto.Bytes;
+
 /**
  * Whether the host key we were shown is the one we saw last time.
  *
@@ -44,7 +46,7 @@ public final class KnownHosts {
         if (known == null) {
             return UNKNOWN;
         }
-        return equalBytes(known, key.blob()) ? MATCHED : CHANGED;
+        return Bytes.equal(known, key.blob()) ? MATCHED : CHANGED;
     }
 
     /** Records a key the user accepted. */
@@ -81,15 +83,4 @@ public final class KnownHosts {
             + " genuinely rebuilt, remove the stored key and connect again.";
     }
 
-    private static boolean equalBytes(byte[] a, byte[] b) {
-        if (a.length != b.length) {
-            return false;
-        }
-        for (int i = 0; i < a.length; i++) {
-            if (a[i] != b[i]) {
-                return false;
-            }
-        }
-        return true;
-    }
 }
