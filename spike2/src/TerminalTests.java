@@ -1,3 +1,4 @@
+import berryssh.device.Keyboard;
 import berryssh.terminal.VT320;
 
 import java.io.IOException;
@@ -28,6 +29,7 @@ public class TerminalTests {
         handlesEscapeSequences();
         scrolls();
         sendsKeys();
+        dispatchesKeys();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -124,6 +126,77 @@ public class TerminalTests {
         arrows.keyPressed(VT320.VK_UP, 0);
         checkTrue("the up arrow sends an escape sequence",
             arrows.sent.length() >= 3 && arrows.sent.charAt(0) == 27);
+    }
+
+    /**
+     * Key dispatch, and specifically the ordering that got it wrong on the
+     * device.
+     *
+     * MIDP lets a device map keys to game actions, and BlackBerry maps the
+     * letters so that games written for a numeric keypad work on a QWERTY: 'w'
+     * reports UP, 'a' reports LEFT. Consulting the game action before the
+     * character therefore turns typing into cursor movement on exactly those
+     * letters and leaves every other key working — which is why it presented as
+     * "some keys do nothing and some produce something else" rather than as a
+     * keyboard that was plainly broken.
+     *
+     * The MIDP game action values are written out here rather than imported, so
+     * the test does not depend on the stub jar being on the host classpath.
+     */
+    private static void dispatchesKeys() {
+        final int UP = 1, LEFT = 2, RIGHT = 5, DOWN = 6;
+
+        // A letter that the device also calls a direction is still a letter.
+        checkTrue("'w' types 'w' even though the device reports UP",
+            "w".equals(sendKey('w', UP)));
+        checkTrue("'a' types 'a' even though the device reports LEFT",
+            "a".equals(sendKey('a', LEFT)));
+        checkTrue("'s' types 's' even though the device reports DOWN",
+            "s".equals(sendKey('s', DOWN)));
+        checkTrue("'d' types 'd' even though the device reports RIGHT",
+            "d".equals(sendKey('d', RIGHT)));
+
+        checkTrue("a letter with no game action still types itself",
+            "q".equals(sendKey('q', 0)));
+        checkTrue("space is a character, not a fire button",
+            " ".equals(sendKey(' ', 8)));
+
+        // The trackpad reports a direction and no character, so it still moves.
+        String up = sendKey(-1, UP);
+        checkTrue("a key with no character and a direction sends a cursor sequence",
+            up.length() >= 3 && up.charAt(0) == 27);
+
+        checkTrue("Enter sends a carriage return", sendKey(13, 0).indexOf('\r') >= 0);
+        // Backspace has to reach VT320 through keyPressed: keyTyped drops it,
+        // which sent nothing at all and left no way to correct a typo.
+        checkTrue("Backspace sends something", sendKey(8, 0).length() > 0);
+        checkTrue("Delete deletes too, on a handset with one such key",
+            sendKey(127, 0).equals(sendKey(8, 0)) && sendKey(127, 0).length() > 0);
+        checkTrue("Tab sends one", "\t".equals(sendKey(9, 0)));
+
+        // A key we know nothing about must send nothing rather than a guess.
+        checkTrue("an unmapped key sends nothing", "".equals(sendKey(-999, 0)));
+
+        // Sticky Ctrl, on the character path.
+        Headless t = new Headless(20, 5);
+        Keyboard k = new Keyboard(t);
+        k.toggleControl();
+        checkTrue("Ctrl is armed", k.controlPending());
+        k.keyPressed('c', 0);
+        checkTrue("Ctrl-C sends 0x03 and disarms",
+            t.sent.length() == 1 && t.sent.charAt(0) == 3 && !k.controlPending());
+
+        // Ctrl-I must be Tab. Under a Turkish locale a case fold would make
+        // this the one letter of the alphabet that stopped working.
+        checkTrue("Ctrl-I is Tab under any locale", Keyboard.controlOf('i') == 9);
+        checkTrue("Ctrl-I is Tab from the capital too", Keyboard.controlOf('I') == 9);
+    }
+
+    /** Feeds one key through the dispatcher and returns what reached the wire. */
+    private static String sendKey(int keyCode, int gameAction) {
+        Headless t = new Headless(20, 5);
+        new Keyboard(t).keyPressed(keyCode, gameAction);
+        return t.sent.toString();
     }
 
     /** Builds an escape sequence without putting a control byte in the source. */
