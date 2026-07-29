@@ -45,3 +45,6 @@ java -cp classes CryptoTests
 
 echo "==> running transport vectors on host JVM"
 java -cp classes TransportTests
+
+echo "==> running terminal vectors on host JVM"
+java -cp classes TerminalTests

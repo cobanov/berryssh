@@ -9,6 +9,7 @@ import berryssh.protocol.Negotiation;
 import berryssh.protocol.Transport;
 import berryssh.protocol.UserAuth;
 import berryssh.protocol.Utf8;
+import berryssh.terminal.VT320;
 
 import java.io.IOException;
 import java.net.Socket;
@@ -54,6 +55,7 @@ public class ServerTests {
         encryptsWithRealServer();
         authenticatesWithRealServer();
         runsAShellOnRealServer();
+        rendersARealSessionThroughTheTerminal();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -316,6 +318,84 @@ public class ServerTests {
 
             channel.close();
             System.out.println("        shell exit status " + channel.exitStatus());
+        } finally {
+            socket.close();
+        }
+    }
+
+    /**
+     * A real session's bytes, through the terminal emulator.
+     *
+     * The offline terminal vectors use sequences somebody chose to write down.
+     * This one takes what a shell on a pty actually emits — echo, prompts,
+     * clearing, cursor addressing, colour, and the ordering between them — and
+     * checks the screen that results. That combination is what a hand-written
+     * vector cannot reproduce.
+     */
+    private static void rendersARealSessionThroughTheTerminal() throws Exception {
+        Socket socket = new Socket(host, port);
+        try {
+            socket.setSoTimeout(20000);
+            EntropyPool random = new EntropyPool();
+            random.seed();
+            Connection connection = new Connection(
+                socket.getInputStream(), socket.getOutputStream(), random);
+            connection.handshake();
+
+            UserAuth auth = new UserAuth(connection, user);
+            auth.begin();
+            auth.queryMethods();
+            auth.password(password);
+
+            final Channel channel = Channel.openSession(connection);
+            channel.requestPty("xterm", 60, 25);
+            channel.requestShell();
+
+            VT320 terminal = new VT320(60, 25) {
+                public void sendData(byte[] b, int offset, int length) throws IOException {
+                    channel.write(b, offset, length);
+                }
+
+                public void beep() {
+                }
+
+                public void resize() {
+                }
+            };
+
+            // Clear, address the cursor, print in colour, then leave so that no
+            // prompt is drawn over the result. The escapes are written as shell
+            // octal so that this source file holds no control bytes.
+            channel.write(Utf8.encode(
+                "printf '\\033[2J\\033[5;10H\\033[32mMARKER\\033[0m'; exit\n"));
+
+            byte[] buffer = new byte[4096];
+            for (;;) {
+                int n = channel.read(buffer, 0, buffer.length);
+                if (n < 0) {
+                    break;
+                }
+                terminal.putString(Utf8.decode(buffer, 0, n));
+            }
+
+            StringBuffer atMarker = new StringBuffer();
+            for (int i = 0; i < 6; i++) {
+                atMarker.append(terminal.getChar(9 + i, 4));
+            }
+            checkTrue("a real session's escape sequences land where the server put them",
+                "MARKER".equals(atMarker.toString()));
+
+            // The clear really happened: the echoed command line was on row 0
+            // and is gone.
+            boolean topRowClear = true;
+            for (int i = 0; i < 60; i++) {
+                if (terminal.getChar(i, 0) > 32) {
+                    topRowClear = false;
+                }
+            }
+            checkTrue("the screen the server cleared is clear", topRowClear);
+
+            channel.close();
         } finally {
             socket.close();
         }

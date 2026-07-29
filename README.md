@@ -135,6 +135,7 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
     lib/            dependency fetcher
     ssh/src/        the client library
     spike1/         device capability probe
+    ssh/res/        font atlases
     spike2/         test vectors, run on the host
     tools/          OTA server
 
@@ -152,7 +153,8 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
 - [x] User authentication: `none`, `password`, `publickey` with Ed25519
 - [x] Channels, `pty-req`, shell — a working session against OpenSSH 9.2p1
 - [x] Host key trust, stored in RMS
-- [ ] Terminal emulation and UI
+- [x] VT320 terminal emulation, and a bitmap font renderer
+- [ ] Keyboard mapping, and the MIDlet that ties it together
 
 ## Prior art
 
