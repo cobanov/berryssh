@@ -172,11 +172,11 @@ public final class BitmapFont {
         bgRed = (background >> 16) & 0xff;
         bgGreen = (background >> 8) & 0xff;
         bgBlue = background & 0xff;
-
-        // Everything cached was for the previous pair.
-        for (int i = 0; i < cachedFor.length; i++) {
-            cachedFor[i] = -1;
-        }
+        // Nothing is cleared here. cachedFor already records which pair each
+        // glyph was rendered for, so a stale entry is recoloured when it is
+        // next drawn — clearing would make a colour change cost the whole
+        // atlas instead of the handful of glyphs actually on screen, and a
+        // terminal UI changes colour many times per line.
     }
 
     /**

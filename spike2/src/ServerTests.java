@@ -33,6 +33,7 @@ public class ServerTests {
     private static int port = 2222;
     private static String user = "bb";
     private static String password = "bbssh";
+    private static int rekeyPort = 2223;
 
     private static int passed;
     private static int failed;
@@ -57,6 +58,7 @@ public class ServerTests {
         runsAShellOnRealServer();
         rendersARealSessionThroughTheTerminal();
         survivesTypingWhileOutputArrives();
+        survivesARekey();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -513,6 +515,99 @@ public class ServerTests {
                 after.append(Utf8.decode(buffer, 0, n));
             }
             checkTrue("the connection still works afterwards",
+                after.toString().indexOf("still-alive") >= 0);
+
+            channel.write(Utf8.encode("exit\n"));
+            channel.close();
+        } finally {
+            socket.close();
+        }
+    }
+
+    /**
+     * A server asking to rekey mid-session.
+     *
+     * OpenSSH does this after about a gigabyte or an hour. Before it was
+     * handled, the KEXINIT reached the channel and the session died with a
+     * complaint about an unexpected message — an hour into a connection, for no
+     * visible reason.
+     *
+     * Waiting an hour is not a test, so this runs against a throwaway server
+     * with RekeyLimit set to 64 KB (tools/rekey-server.sh). It is deliberately
+     * not the shared container: that one is what the handset connects to.
+     */
+    private static void survivesARekey() throws Exception {
+        Socket socket;
+        try {
+            socket = new Socket(host, rekeyPort);
+        } catch (IOException e) {
+            System.out.println("  SKIP  rekey: nothing on " + host + ":" + rekeyPort
+                + " (tools/rekey-server.sh)");
+            return;
+        }
+        try {
+            socket.setSoTimeout(30000);
+            EntropyPool random = new EntropyPool();
+            random.seed();
+            Connection connection = new Connection(
+                socket.getInputStream(), socket.getOutputStream(), random);
+            connection.handshake();
+            byte[] firstSessionId = connection.sessionId();
+
+            UserAuth auth = new UserAuth(connection, user);
+            auth.begin();
+            auth.queryMethods();
+            auth.password(password);
+
+            Channel channel = Channel.openSession(connection);
+            channel.requestPty("xterm", 60, 25);
+            channel.requestShell();
+
+            // Well past 64 KB, so the server asks to rekey more than once.
+            channel.write(Utf8.encode("seq 1 10''0000\n"));
+
+            long total = 0;
+            boolean sawEnd = false;
+            StringBuffer tail = new StringBuffer();
+            byte[] buffer = new byte[4096];
+            while (!sawEnd) {
+                int n = channel.read(buffer, 0, buffer.length);
+                if (n < 0) {
+                    break;
+                }
+                total += n;
+                tail.append(Utf8.decode(buffer, 0, n));
+                if (tail.length() > 4096) {
+                    tail.delete(0, tail.length() - 2048);
+                }
+                if (tail.toString().indexOf("100000") >= 0) {
+                    sawEnd = true;
+                }
+            }
+
+            checkTrue("a session survives the rekeys a 64 KB limit forces",
+                sawEnd && total > 64 * 1024);
+            System.out.println("        " + (total / 1024) + " KB through a "
+                + (total / 65536) + "-rekey session");
+
+            // The session identifier is fixed at the first exchange for the
+            // life of the connection: it is what the authentication signature
+            // was bound to, so replacing it would invalidate it after the fact.
+            checkTrue("the session identifier did not change",
+                sameBytes(firstSessionId, connection.sessionId()));
+
+            channel.write(Utf8.encode("echo st''ill-alive\n"));
+            StringBuffer after = new StringBuffer();
+            long deadline = System.currentTimeMillis() + 15000;
+            while (after.toString().indexOf("still-alive") < 0
+                    && System.currentTimeMillis() < deadline) {
+                int n = channel.read(buffer, 0, buffer.length);
+                if (n < 0) {
+                    break;
+                }
+                after.append(Utf8.decode(buffer, 0, n));
+            }
+            checkTrue("the connection still works after rekeying",
                 after.toString().indexOf("still-alive") >= 0);
 
             channel.write(Utf8.encode("exit\n"));

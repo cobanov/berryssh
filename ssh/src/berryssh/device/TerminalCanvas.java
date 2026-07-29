@@ -23,6 +23,27 @@ public final class TerminalCanvas extends Canvas {
     private static final int FOREGROUND = 0xffffff;
     private static final int STATUS = 0x808080;
 
+    /**
+     * The eight ANSI colours, and their bold forms.
+     *
+     * The xterm values rather than pure primaries: pure blue on black is close
+     * to unreadable, and a terminal spends a lot of its time showing blue.
+     */
+    private static final int[] ANSI = {
+        0x000000, 0xcd0000, 0x00cd00, 0xcdcd00,
+        0x0000ee, 0xcd00cd, 0x00cdcd, 0xe5e5e5
+    };
+    private static final int[] ANSI_BOLD = {
+        0x7f7f7f, 0xff0000, 0x00ff00, 0xffff00,
+        0x5c5cff, 0xff00ff, 0x00ffff, 0xffffff
+    };
+
+    // VT320 packs these into the high half of each cell.
+    private static final int BOLD = 0x01;
+    private static final int INVERT = 0x04;
+    private static final int COLOUR_FOREGROUND = 0x0f0;
+    private static final int COLOUR_BACKGROUND = 0xf00;
+
     private final BitmapFont font;
     private VT320 terminal;
     private Keyboard keyboard;
@@ -210,10 +231,34 @@ public final class TerminalCanvas extends Canvas {
                     }
                     long[] cells = data[line];
                     for (int column = 0; column < columns && column < cells.length; column++) {
-                        char c = (char) cells[column];
+                        long cell = cells[column];
+                        drawCell(g, (char) cell, (int) (cell >>> 32),
+                            column * font.cellWidth(), row * font.cellHeight());
+                    }
+                }
+
+                // The cursor last, so it sits over whatever is beneath it. Not
+                // drawn when the view is scrolled back: it would then point at
+                // a line that is not the one being edited, which is worse than
+                // showing nothing.
+                if (scrollOffset == 0) {
+                    int cursorRow = terminal.ROW;
+                    int cursorColumn = terminal.COLUMN;
+                    if (cursorRow >= 0 && cursorRow < rows
+                            && cursorColumn >= 0 && cursorColumn < columns) {
+                        int x = cursorColumn * font.cellWidth();
+                        int y = cursorRow * font.cellHeight();
+                        int line = base + cursorRow;
+                        char c = ' ';
+                        if (data != null && line >= 0 && line < data.length
+                                && cursorColumn < data[line].length) {
+                            c = (char) data[line][cursorColumn];
+                        }
+                        g.setColor(FOREGROUND);
+                        g.fillRect(x, y, font.cellWidth(), font.cellHeight());
                         if (c > 32) {
-                            font.drawChar(g, c,
-                                column * font.cellWidth(), row * font.cellHeight());
+                            font.setColours(BACKGROUND, FOREGROUND);
+                            font.drawChar(g, c, x, y);
                         }
                     }
                 }
@@ -237,6 +282,42 @@ public final class TerminalCanvas extends Canvas {
         int y = height - font.cellHeight();
         for (int i = 0; i < line.length() && i < columns(); i++) {
             font.drawChar(g, line.charAt(i), i * font.cellWidth(), y);
+        }
+    }
+
+    /**
+     * Draws one cell, in the colours its attributes ask for.
+     *
+     * The background is painted only when it is not the default, since the
+     * whole canvas has already been cleared to that — and a fillRect per cell
+     * across a 60x24 grid is 1440 of them per frame on a handset.
+     */
+    private void drawCell(Graphics g, char c, int attributes, int x, int y) {
+        int foregroundIndex = (attributes & COLOUR_FOREGROUND) >> 4;
+        int backgroundIndex = (attributes & COLOUR_BACKGROUND) >> 8;
+        boolean bold = (attributes & BOLD) != 0;
+
+        // Zero means "whatever the terminal's default is", not colour zero.
+        int foreground = foregroundIndex == 0
+            ? FOREGROUND
+            : (bold ? ANSI_BOLD : ANSI)[foregroundIndex - 1];
+        int background = backgroundIndex == 0
+            ? BACKGROUND
+            : ANSI[backgroundIndex - 1];
+
+        if ((attributes & INVERT) != 0) {
+            int swap = foreground;
+            foreground = background;
+            background = swap;
+        }
+
+        if (background != BACKGROUND) {
+            g.setColor(background);
+            g.fillRect(x, y, font.cellWidth(), font.cellHeight());
+        }
+        if (c > 32) {
+            font.setColours(foreground, background);
+            font.drawChar(g, c, x, y);
         }
     }
 

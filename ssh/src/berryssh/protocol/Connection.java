@@ -17,7 +17,7 @@ import berryssh.crypto.EntropyPool;
  *
  * Written for -source 1.3: no generics, no enhanced for, no StringBuilder.
  */
-public final class Connection {
+public final class Connection implements Transport.RekeyHandler {
 
     private final Transport transport;
     private final EntropyPool random;
@@ -89,7 +89,69 @@ public final class Connection {
         transport.decryptIncoming(new PacketCipher(
             result.deriveKey('D', sessionId, PacketCipher.KEY_LENGTH)));
 
+        // Only now. Registered any earlier — in the constructor, as it was —
+        // the server's opening KEXINIT is itself mistaken for a rekey request
+        // and the initial handshake never completes.
+        transport.setRekeyHandler(this);
+
         return hostKey;
+    }
+
+    /**
+     * Runs the key exchange again, at the server's request.
+     *
+     * The session identifier deliberately does not change. RFC 4253 fixes it to
+     * the first exchange hash for the life of the connection, and it is what
+     * the user authentication signature was bound to — replacing it would
+     * retroactively invalidate the thing that proved who we are.
+     *
+     * The send lock is held throughout. Between our NEWKEYS and the server's,
+     * the two directions are on different keys, and a keystroke that slipped
+     * out in the middle would be encrypted under keys the server had already
+     * retired.
+     */
+    public void rekey(byte[] serverKexInit) throws IOException {
+        synchronized (transport.sendLock()) {
+            KexInit ours = KexInit.client(random);
+            transport.writePacket(ours.payload());
+            KexInit theirs = KexInit.parse(serverKexInit);
+
+            Negotiation negotiated = Negotiation.between(ours, theirs);
+            if (negotiated.discardGuessedPacket()) {
+                transport.readMessage();
+            }
+
+            KeyExchange.Result result = KeyExchange.run(transport, ours, theirs, random);
+
+            // The host key must still be the one already trusted. A server that
+            // presents a different one mid-session is not the server we
+            // authenticated to.
+            if (!sameBytes(hostKey.blob(), result.hostKey().blob())) {
+                throw new SshException("the host key changed during a rekey");
+            }
+
+            WireWriter newKeys = new WireWriter(8);
+            newKeys.writeByte(Message.NEWKEYS);
+            transport.writePacket(newKeys.toByteArray());
+            transport.encryptOutgoing(new PacketCipher(
+                result.deriveKey('C', sessionId, PacketCipher.KEY_LENGTH)));
+
+            expect(transport.readMessage(), Message.NEWKEYS);
+            transport.decryptIncoming(new PacketCipher(
+                result.deriveKey('D', sessionId, PacketCipher.KEY_LENGTH)));
+        }
+    }
+
+    private static boolean sameBytes(byte[] a, byte[] b) {
+        if (a == null || b == null || a.length != b.length) {
+            return false;
+        }
+        for (int i = 0; i < a.length; i++) {
+            if (a[i] != b[i]) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**

@@ -14,7 +14,7 @@ cd "$(dirname "$0")"
 
 NAME=berryssh
 VENDOR="berryssh"
-VERSION=0.3.0
+VERSION=0.3.1
 MIDLET_CLASS=berryssh.device.BerrysshMIDlet
 
 OUT=out
