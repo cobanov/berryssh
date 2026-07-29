@@ -30,6 +30,7 @@ public class TerminalTests {
         scrolls();
         sendsKeys();
         dispatchesKeys();
+        keepsScrollback();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -190,6 +191,47 @@ public class TerminalTests {
         // this the one letter of the alphabet that stopped working.
         checkTrue("Ctrl-I is Tab under any locale", Keyboard.controlOf('i') == 9);
         checkTrue("Ctrl-I is Tab from the capital too", Keyboard.controlOf('I') == 9);
+    }
+
+    /**
+     * Scrollback, which the emulator does not have until it is asked for.
+     *
+     * The constructor sizes the buffer to the screen, so a terminal built and
+     * left alone keeps nothing: paging up would show the screen already on
+     * display. This is the mechanism the canvas reads through, checked here
+     * because the canvas itself needs MIDP and cannot run on the host.
+     */
+    private static void keepsScrollback() {
+        Headless plain = new Headless(20, 4);
+        plain.putString("one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+        checkTrue("without asking, nothing is kept above the screen",
+            plain.screenBase == 0);
+
+        Headless t = new Headless(20, 4);
+        t.setScrollbackBufferSize(100);
+        for (int i = 1; i <= 40; i++) {
+            t.putString("line" + i + "\r\n");
+        }
+
+        checkTrue("history accumulates above the live screen", t.screenBase > 0);
+
+        // The live screen still shows the end.
+        checkTrue("the live screen is the most recent output",
+            "line40".equals(row(t, 2, 6)));
+
+        // And the buffer holds what scrolled past, which is what the canvas
+        // reads when it pages up.
+        boolean foundEarlier = false;
+        for (int line = 0; line < t.screenBase; line++) {
+            StringBuffer sb = new StringBuffer();
+            for (int c = 0; c < 6; c++) {
+                sb.append((char) t.terminalData[line][c]);
+            }
+            if ("line10".equals(sb.toString())) {
+                foundEarlier = true;
+            }
+        }
+        checkTrue("a line that scrolled off is still in the buffer", foundEarlier);
     }
 
     /** Feeds one key through the dispatcher and returns what reached the wire. */

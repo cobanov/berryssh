@@ -49,6 +49,13 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
 
     private static final String NEW_CONNECTION = "New connection...";
 
+    /**
+     * Lines kept above the screen. The device measured ~357 MB of free heap and
+     * a line is a few hundred bytes, so this is nothing — and a terminal that
+     * cannot show what just scrolled past is barely a terminal on 24 rows.
+     */
+    private static final int SCROLLBACK_LINES = 500;
+
     // The connection list
     private final Command connect = new Command("Connect", Command.ITEM, 1);
     private final Command newConnection = new Command("New", Command.SCREEN, 2);
@@ -70,10 +77,12 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     // The terminal
     private final Command control = new Command("Ctrl", Command.SCREEN, 1);
     private final Command escape = new Command("Esc", Command.SCREEN, 2);
-    private final Command keys = new Command("Keys", Command.SCREEN, 3);
-    private final Command fullScreen = new Command("Full screen", Command.SCREEN, 4);
-    private final Command reconnect = new Command("Reconnect", Command.SCREEN, 5);
-    private final Command disconnect = new Command("Disconnect", Command.STOP, 6);
+    private final Command pageUp = new Command("Page up", Command.SCREEN, 3);
+    private final Command pageDown = new Command("Page down", Command.SCREEN, 4);
+    private final Command keys = new Command("Keys", Command.SCREEN, 5);
+    private final Command fullScreen = new Command("Full screen", Command.SCREEN, 6);
+    private final Command reconnect = new Command("Reconnect", Command.SCREEN, 7);
+    private final Command disconnect = new Command("Disconnect", Command.STOP, 8);
 
     private Display display;
     private List connections;
@@ -252,6 +261,14 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             }
             return;
         }
+        if (command == pageUp) {
+            canvas.pageUp();
+            return;
+        }
+        if (command == pageDown) {
+            canvas.pageDown();
+            return;
+        }
         if (command == keys) {
             canvas.toggleKeyCodes();
             return;
@@ -369,6 +386,8 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         canvas = new TerminalCanvas(font);
         canvas.addCommand(control);
         canvas.addCommand(escape);
+        canvas.addCommand(pageUp);
+        canvas.addCommand(pageDown);
         canvas.addCommand(keys);
         canvas.addCommand(fullScreen);
         canvas.addCommand(reconnect);
@@ -454,6 +473,10 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
                 public void resize() {
                 }
             };
+            // The constructor sizes the buffer to the screen, so without this
+            // there is no scrollback at all and paging up would show the screen
+            // that is already there.
+            terminal.setScrollbackBufferSize(SCROLLBACK_LINES);
             keyboard = new Keyboard(terminal);
             canvas.attach(terminal, keyboard);
             canvas.setStatus(profile.user() + "@" + host + "  " + columns + "x" + rows);

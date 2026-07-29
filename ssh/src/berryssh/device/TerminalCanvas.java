@@ -28,6 +28,9 @@ public final class TerminalCanvas extends Canvas {
     private Keyboard keyboard;
     private String status = "";
 
+    /** Rows above the live screen currently being looked at. Zero is live. */
+    private int scrollOffset;
+
     private boolean shown;
     private boolean showKeyCodes;
     private String lastKey = "";
@@ -124,6 +127,48 @@ public final class TerminalCanvas extends Canvas {
      * can be read off the hardware in the place they matter rather than from a
      * separate probe.
      */
+    /**
+     * Moves the view back through the scrollback, a screen at a time.
+     *
+     * Bounded by what the buffer actually holds rather than by a guess: asking
+     * for a line that was never kept would draw whatever the array happens to
+     * contain there.
+     */
+    public void pageUp() {
+        int available = terminal == null ? 0 : terminal.screenBase;
+        scrollOffset += rows() - 1;
+        if (scrollOffset > available) {
+            scrollOffset = available;
+        }
+        repaint();
+    }
+
+    public void pageDown() {
+        scrollOffset -= rows() - 1;
+        if (scrollOffset < 0) {
+            scrollOffset = 0;
+        }
+        repaint();
+    }
+
+    /**
+     * Returns to the live screen.
+     *
+     * Called whenever a key is typed. Reading history and then typing blind
+     * into a screen that is not the one being shown is worse than not being
+     * able to scroll at all.
+     */
+    public void toLive() {
+        if (scrollOffset != 0) {
+            scrollOffset = 0;
+            repaint();
+        }
+    }
+
+    public boolean isScrolledBack() {
+        return scrollOffset > 0;
+    }
+
     public void toggleKeyCodes() {
         showKeyCodes = !showKeyCodes;
         repaint();
@@ -150,9 +195,22 @@ public final class TerminalCanvas extends Canvas {
             // half-drawn frame, which would tear the picture and, during a
             // resize, index past the end of it.
             synchronized (terminal.getTermBufferMutex()) {
+                // getChar always reads the live screen, so the scrollback is
+                // read from the buffer directly at an offset. The character is
+                // the low half of each cell; the high half is its attributes.
+                int base = terminal.screenBase - scrollOffset;
+                if (base < 0) {
+                    base = 0;
+                }
+                long[][] data = terminal.terminalData;
                 for (int row = 0; row < rows; row++) {
-                    for (int column = 0; column < columns; column++) {
-                        char c = terminal.getChar(column, row);
+                    int line = base + row;
+                    if (data == null || line < 0 || line >= data.length) {
+                        continue;
+                    }
+                    long[] cells = data[line];
+                    for (int column = 0; column < columns && column < cells.length; column++) {
+                        char c = (char) cells[column];
                         if (c > 32) {
                             font.drawChar(g, c,
                                 column * font.cellWidth(), row * font.cellHeight());
@@ -168,6 +226,12 @@ public final class TerminalCanvas extends Canvas {
         String line = showKeyCodes ? lastKey : status;
         if (keyboard != null && keyboard.controlPending()) {
             line = "^ " + line;
+        }
+        // An old screen and a live one look exactly alike, so say which this
+        // is. Without it, output arriving while scrolled back looks like a
+        // terminal that has stopped responding.
+        if (scrollOffset > 0) {
+            line = "-" + scrollOffset + " " + line;
         }
         font.setColours(STATUS, BACKGROUND);
         int y = height - font.cellHeight();
@@ -205,6 +269,7 @@ public final class TerminalCanvas extends Canvas {
             + " grid " + columns() + "x" + rows();
 
         if (keyboard != null) {
+            toLive();
             keyboard.keyPressed(keyCode, action);
         }
         repaint();
