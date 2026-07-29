@@ -41,7 +41,7 @@ No BlackBerry SDK is involved. Dependencies are fetched, not vendored:
 
 ```sh
 lib/fetch.sh          # MIDP/CLDC API stubs and ProGuard, from Maven Central
-spike1/build.sh       # -> spike1/out/Probe.jad + Probe.jar
+./build.sh            # -> out/berryssh.jad + berryssh.jar
 ```
 
 - **API stubs**: microemu's `cldcapi11` / `midpapi20`
@@ -70,7 +70,7 @@ Plain HTTP is deliberate: the OS 7 browser's trust store predates every
 currently issued CA.
 
 ```sh
-python3 tools/ota_server.py spike1/out
+python3 tools/ota_server.py out
 ```
 
 Then open the printed URL in the device's native browser, over Wi-Fi.
@@ -133,7 +133,7 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
 ## Layout
 
     lib/            dependency fetcher
-    ssh/src/        the client library
+    ssh/src/        the client library and the MIDlet
     spike1/         device capability probe
     ssh/res/        font atlases
     spike2/         test vectors, run on the host
@@ -154,7 +154,8 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
 - [x] Channels, `pty-req`, shell — a working session against OpenSSH 9.2p1
 - [x] Host key trust, stored in RMS
 - [x] VT320 terminal emulation, and a bitmap font renderer
-- [ ] Keyboard mapping, and the MIDlet that ties it together
+- [x] A MIDlet that connects, authenticates and runs a shell
+- [ ] Keyboard mapping confirmed against the hardware's real key codes
 
 ## Prior art
 

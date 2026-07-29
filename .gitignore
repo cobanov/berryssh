@@ -8,3 +8,8 @@ lib/*.jar
 
 # macOS
 .DS_Store
+
+# Build output
+/out/
+/classes/
+/classes-pv/
