@@ -48,6 +48,20 @@ public final class Transport {
     private final OutputStream out;
 
     /**
+     * One lock per direction, not one lock.
+     *
+     * Sending and receiving each have to be serialised — the sequence numbers
+     * are the AEAD nonces, so a lost increment means two packets sealed under
+     * one nonce, which in a stream cipher is the failure the construction
+     * exists to prevent. But they must be serialised separately: a reader
+     * parked on a socket read holds its lock for as long as the server stays
+     * quiet, and sharing one lock would mean nothing could ever be sent during
+     * that time, which is all of an idle session.
+     */
+    private final Object sendLock = new Object();
+    private final Object receiveLock = new Object();
+
+    /**
      * Padding only has to be unpredictable enough to satisfy RFC 4253's SHOULD.
      * It is not key material: before the key exchange it travels in the clear
      * with nothing to hide, and afterwards the AEAD covers it. Generating a
@@ -150,6 +164,12 @@ public final class Transport {
      * with at least 4 bytes of padding and at least 16 bytes in total.
      */
     public void writePacket(byte[] payload) throws IOException {
+        synchronized (sendLock) {
+            writeLocked(payload);
+        }
+    }
+
+    private void writeLocked(byte[] payload) throws IOException {
         byte[] body = pad(payload);
         if (outgoing == null) {
             byte[] packet = new byte[4 + body.length];
@@ -200,6 +220,12 @@ public final class Transport {
 
     /** Reads one packet and returns its payload. */
     public byte[] readPacket() throws IOException {
+        synchronized (receiveLock) {
+            return readLocked();
+        }
+    }
+
+    private byte[] readLocked() throws IOException {
         byte[] header = new byte[LENGTH_FIELD];
         readFully(header, 0, LENGTH_FIELD);
 

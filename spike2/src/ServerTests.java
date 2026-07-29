@@ -56,6 +56,7 @@ public class ServerTests {
         authenticatesWithRealServer();
         runsAShellOnRealServer();
         rendersARealSessionThroughTheTerminal();
+        survivesTypingWhileOutputArrives();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -395,6 +396,126 @@ public class ServerTests {
             }
             checkTrue("the screen the server cleared is clear", topRowClear);
 
+            channel.close();
+        } finally {
+            socket.close();
+        }
+    }
+
+    /**
+     * Two threads on one connection, which is what the application does every
+     * time somebody types while something is printing.
+     *
+     * The reader sends window updates as it consumes; the writer sends the
+     * keystrokes. Both go through the same transport and the same sequence
+     * numbers, and those numbers are the AEAD nonces — so if sending is not
+     * serialised, two packets get sealed under one nonce and the far end stops
+     * being able to decrypt anything. The failure is total and permanent, not
+     * intermittent, which is the one mercy in it.
+     *
+     * A marker command afterwards is the check: if the streams desynchronised
+     * at any point, nothing gets that far.
+     */
+    private static void survivesTypingWhileOutputArrives() throws Exception {
+        Socket socket = new Socket(host, port);
+        try {
+            socket.setSoTimeout(30000);
+            EntropyPool random = new EntropyPool();
+            random.seed();
+            Connection connection = new Connection(
+                socket.getInputStream(), socket.getOutputStream(), random);
+            connection.handshake();
+
+            UserAuth auth = new UserAuth(connection, user);
+            auth.begin();
+            auth.queryMethods();
+            auth.password(password);
+
+            final Channel channel = Channel.openSession(connection);
+            channel.requestPty("xterm", 60, 25);
+            channel.requestShell();
+
+            // Big enough to cross the window refill threshold, which is the
+            // whole point: below it the reader never sends anything, only one
+            // thread is writing, and the race this exists to catch cannot
+            // happen. At 1 MB per refill this is several.
+            // Written split so the pty's echo of the command line cannot itself
+            // contain the marker. It can, and did: the loop then ended on the
+            // echo after thirteen bytes and the test measured nothing at all,
+            // which is why it passed with the bug still in place.
+            channel.write(Utf8.encode("seq 1 30''0000\n"));
+
+            final Exception[] writerFailure = new Exception[1];
+            final boolean[] readingDone = new boolean[1];
+            final long[] typed = new long[1];
+            Thread typist = new Thread(new Runnable() {
+                public void run() {
+                    try {
+                        // For as long as the reader is reading, rather than a
+                        // fixed count that finishes in the first moment. The
+                        // contention is the test; a burst that is over before
+                        // the transfer starts exercises nothing.
+                        while (!readingDone[0]) {
+                            channel.write(Utf8.encode("x"));
+                            typed[0]++;
+                        }
+                    } catch (Exception e) {
+                        writerFailure[0] = e;
+                    }
+                }
+            });
+            typist.start();
+
+            // Only the tail is kept: several megabytes in a StringBuffer would
+            // be measuring the host's memory, not the protocol.
+            boolean sawEnd = false;
+            long total = 0;
+            StringBuffer tail = new StringBuffer();
+            byte[] buffer = new byte[4096];
+            while (!sawEnd) {
+                int n = channel.read(buffer, 0, buffer.length);
+                if (n < 0) {
+                    System.out.println("        read ended after " + total
+                        + " bytes; finished=" + channel.isFinished());
+                    break;
+                }
+                total += n;
+                tail.append(Utf8.decode(buffer, 0, n));
+                if (tail.length() > 4096) {
+                    tail.delete(0, tail.length() - 2048);
+                }
+                if (tail.toString().indexOf("300000") >= 0) {
+                    sawEnd = true;
+                }
+            }
+            readingDone[0] = true;
+            typist.join(30000);
+
+            checkTrue("typing while output arrives does not break the writer",
+                writerFailure[0] == null);
+            checkTrue("all of the output arrived, past several window refills",
+                sawEnd && total > 1024 * 1024);
+            System.out.println("        " + (total / 1024) + " KB read while "
+                + typed[0] + " keystrokes were sent");
+
+            // Ctrl-U first, to throw away the line of 'x' the typing left.
+            channel.write(new byte[] { 0x15 });
+            channel.write(Utf8.encode("echo st''ill-alive\n"));
+
+            StringBuffer after = new StringBuffer();
+            long deadline = System.currentTimeMillis() + 15000;
+            while (after.toString().indexOf("still-alive") < 0
+                    && System.currentTimeMillis() < deadline) {
+                int n = channel.read(buffer, 0, buffer.length);
+                if (n < 0) {
+                    break;
+                }
+                after.append(Utf8.decode(buffer, 0, n));
+            }
+            checkTrue("the connection still works afterwards",
+                after.toString().indexOf("still-alive") >= 0);
+
+            channel.write(Utf8.encode("exit\n"));
             channel.close();
         } finally {
             socket.close();
