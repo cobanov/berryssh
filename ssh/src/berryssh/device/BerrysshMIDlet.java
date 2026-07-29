@@ -24,6 +24,7 @@ import berryssh.protocol.Connection;
 import berryssh.protocol.HostKey;
 import berryssh.protocol.KnownHosts;
 import berryssh.protocol.OpenSshKey;
+import berryssh.protocol.Transport;
 import berryssh.protocol.UserAuth;
 import berryssh.protocol.Utf8;
 import berryssh.protocol.WebSocket;
@@ -52,6 +53,13 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
      * cannot show what just scrolled past is barely a terminal on 24 rows.
      */
     private static final int SCROLLBACK_LINES = 500;
+
+    /**
+     * How long the goodbye packet gets. Long enough for a write into a socket
+     * buffer, short enough that nobody notices it when the connection is
+     * already dead.
+     */
+    private static final int GOODBYE_TIMEOUT_MS = 250;
 
     // The connection list
     private final Command connect = new Command("Connect", Command.ITEM, 1);
@@ -142,6 +150,13 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
 
     private SocketConnection socket;
     private Channel channel;
+
+    /**
+     * Kept so the session can be closed politely. Volatile because it is set on
+     * the session thread and read on the event thread, when Disconnect or Quit
+     * is chosen.
+     */
+    private volatile Connection connection;
     private volatile boolean running;
     private boolean fullScreenOn;
 
@@ -766,8 +781,9 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
                 }
             }
 
-            Connection connection = new Connection(in, out, random);
-            HostKey key = connection.handshake();
+            Connection open = new Connection(in, out, random);
+            connection = open;
+            HostKey key = open.handshake();
 
             // Not the host: through a bridge that is the relay, and every
             // machine behind one would share a record. See Profile.
@@ -795,7 +811,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
                 KnownHosts.accept(hostKeys, identity, port, key);
             }
 
-            UserAuth auth = new UserAuth(connection, profile.user());
+            UserAuth auth = new UserAuth(open, profile.user());
             auth.begin();
             auth.queryMethods();
 
@@ -817,7 +833,18 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
                 return;
             }
 
-            final Channel session = Channel.openSession(connection);
+            // A banner is where a server says the password expires next week,
+            // which environment you have landed on, or whatever notice it is
+            // obliged to show before a session opens. It was already being
+            // read and then dropped. Shown after authentication rather than as
+            // it arrives, so it does not interrupt a password prompt, and with
+            // the canvas as what follows so the session continues behind it.
+            String banner = auth.banner();
+            if (banner != null && banner.trim().length() > 0) {
+                show(banner.trim(), AlertType.INFO, canvas);
+            }
+
+            final Channel session = Channel.openSession(open);
             channel = session;
 
             // The canvas has to be on screen before its size means anything:
@@ -1002,7 +1029,60 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
 
     private void shutdown() {
         running = false;
+        sayGoodbye();
         closeQuietly();
+    }
+
+    /**
+     * Sends SSH_MSG_DISCONNECT before dropping the socket, RFC 4253 section
+     * 11.1. Without it the server cannot tell a user who chose to leave from a
+     * handset that fell off the network, and logs the second.
+     *
+     * On its own thread, with a bounded wait, because this runs on the event
+     * thread and neither half of the write is guaranteed to return. writePacket
+     * takes the send lock, which a rekey can be holding while blocked on a
+     * read, and the write itself goes to a socket that may already be gone.
+     * Waiting forever on a courtesy would trade a tidy server log for an
+     * application that cannot be closed.
+     *
+     * CLDC's Thread has join() but not join(long), so the bound comes from
+     * Object.wait — with a flag, because a thread that finishes before the wait
+     * begins would otherwise notify nobody and cost the full timeout.
+     */
+    private void sayGoodbye() {
+        final Connection open = connection;
+        connection = null;
+        if (open == null) {
+            return;
+        }
+
+        final boolean[] finished = new boolean[1];
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    open.transport().writeDisconnect(
+                        Transport.DISCONNECT_BY_APPLICATION, "disconnected by the user");
+                } catch (Exception e) {
+                    // Going anyway. A failure here means the connection was
+                    // already gone, which is the case this is trying to be
+                    // polite about — reporting it would be absurd.
+                }
+                synchronized (finished) {
+                    finished[0] = true;
+                    finished.notifyAll();
+                }
+            }
+        }).start();
+
+        synchronized (finished) {
+            if (!finished[0]) {
+                try {
+                    finished.wait(GOODBYE_TIMEOUT_MS);
+                } catch (InterruptedException e) {
+                    // Then we leave without it.
+                }
+            }
+        }
     }
 
     private void closeQuietly() {

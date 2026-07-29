@@ -347,6 +347,13 @@ public final class Transport {
         }
     }
 
+    /**
+     * RFC 4253 section 11.1: the reason code for a client that is simply done.
+     * Not an error — a server logs this as an ordinary close rather than as a
+     * connection that broke.
+     */
+    public static final int DISCONNECT_BY_APPLICATION = 11;
+
     /** Tells the peer why we are going, then leaves. RFC 4253 section 11.1. */
     public void writeDisconnect(int reasonCode, String description) throws IOException {
         WireWriter w = new WireWriter(64 + description.length());
