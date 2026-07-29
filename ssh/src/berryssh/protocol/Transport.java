@@ -189,6 +189,57 @@ public final class Transport {
     }
 
     /**
+     * Reads the next packet that carries something the caller should act on.
+     *
+     * IGNORE and DEBUG may arrive at any point, including in the middle of the
+     * key exchange, and are the peer's business rather than ours. Handling them
+     * here rather than at each call site means a server that sends one cannot
+     * put every state machine above this out of step — which is a fault that
+     * would present as an unrelated message-type error somewhere else entirely.
+     *
+     * DISCONNECT is turned into the exception it is. The server's own reason is
+     * far more useful than the read failure that would otherwise follow.
+     */
+    public byte[] readMessage() throws IOException {
+        for (;;) {
+            byte[] payload = readPacket();
+            if (payload.length == 0) {
+                throw new SshException("empty packet");
+            }
+            int type = payload[0] & 0xff;
+            if (type == Message.IGNORE || type == Message.DEBUG) {
+                continue;
+            }
+            if (type == Message.DISCONNECT) {
+                throw disconnectReason(payload);
+            }
+            return payload;
+        }
+    }
+
+    /** Tells the peer why we are going, then leaves. RFC 4253 section 11.1. */
+    public void writeDisconnect(int reasonCode, String description) throws IOException {
+        WireWriter w = new WireWriter(64 + description.length());
+        w.writeByte(Message.DISCONNECT);
+        w.writeUint32(reasonCode);
+        w.writeAsciiString(description);
+        w.writeAsciiString("");
+        writePacket(w.toByteArray());
+    }
+
+    private static SshException disconnectReason(byte[] payload) {
+        try {
+            WireReader r = new WireReader(payload);
+            r.readByte();
+            long code = r.readUint32();
+            String description = r.readAsciiString();
+            return new SshException("server disconnected (" + code + "): " + description);
+        } catch (IOException e) {
+            return new SshException("server disconnected, with an unreadable reason");
+        }
+    }
+
+    /**
      * Reads one CR-LF-terminated line, a byte at a time.
      *
      * Reading ahead in blocks would swallow the first packet, and CLDC has no

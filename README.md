@@ -88,13 +88,16 @@ spike2/run.sh
 
 **Crypto**: FIPS 180-4 for SHA-256 and SHA-512, RFC 8439 §2.4.2 / §2.5.2 /
 §2.8.2 for ChaCha20, Poly1305 and the AEAD construction, RFC 7748 §5.2 / §6.1
-for X25519, and RFC 8032 §7.1 plus negative cases for Ed25519. 28 in total.
+for X25519, and RFC 8032 §7.1 plus negative cases for Ed25519, and the DRBG
+against vectors computed outside it. 38 in total.
 
 **Transport**: RFC 4251 §5 for the wire types, RFC 4253 §6 for the packet
-framing and §7.1 for algorithm negotiation, plus the version exchange and the
-paths that have to reject malformed input. 57 in total. They run under a Turkish
-default locale, which is the device's own and the setting most likely to break
-protocol code without raising an error anywhere.
+framing and §7.1 for algorithm negotiation, RFC 8731 §3 for the exchange hash
+and RFC 4253 §7.2 for key derivation, plus base64, host key parsing, the
+version exchange and the paths that have to reject malformed input. 74 in
+total. They run under a Turkish default locale, which is the device's own and
+the setting most likely to break protocol code without raising an error
+anywhere.
 
 ### Against a real server
 
@@ -144,7 +147,7 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
 - [x] SSH transport: version exchange and the binary packet protocol
 - [x] A random source for key material
 - [x] KEXINIT algorithm negotiation
-- [ ] `curve25519-sha256` key exchange and key derivation
+- [x] `curve25519-sha256` key exchange, host key check and key derivation
 - [ ] `chacha20-poly1305@openssh.com` packet layer
 - [ ] User authentication
 - [ ] Channels, `pty-req`, shell
