@@ -11,6 +11,15 @@ server being weakened to meet it.
 Target hardware is a BlackBerry Bold 9790: a 480×360 screen, a hardware QWERTY
 keyboard, and a real terminal on it.
 
+**[The wiki](https://github.com/cobanov/berryssh/wiki)** is the place to start
+if you want to use it rather than read it:
+[installing](https://github.com/cobanov/berryssh/wiki/Installing),
+[your first connection](https://github.com/cobanov/berryssh/wiki/Your-first-connection),
+[reaching servers that are not on your network](https://github.com/cobanov/berryssh/wiki/Reaching-remote-servers),
+and [troubleshooting](https://github.com/cobanov/berryssh/wiki/Troubleshooting)
+— which on this platform is mostly a list of failures that produce no error
+message.
+
 ## Design
 
 **No RIM APIs.** Everything is standard MIDP and CLDC. This is a deliberate
