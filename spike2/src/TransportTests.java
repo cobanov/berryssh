@@ -1,5 +1,8 @@
 import berryssh.protocol.Ascii;
+import berryssh.protocol.Base64;
+import berryssh.protocol.HostKey;
 import berryssh.protocol.KexInit;
+import berryssh.protocol.KeyExchange;
 import berryssh.protocol.Negotiation;
 import berryssh.protocol.SshException;
 import berryssh.protocol.Transport;
@@ -46,6 +49,9 @@ public class TransportTests {
         malformedInput();
         kexInitEncoding();
         negotiationRules();
+        base64Vectors();
+        hostKeyVectors();
+        exchangeHashVectors();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -417,6 +423,141 @@ public class TransportTests {
                 new String[] { "ssh-ed25519" },
                 new String[] { "aes128-ctr" },
                 false)));
+    }
+
+    /** RFC 4648 section 10. */
+    private static void base64Vectors() {
+        String[][] vectors = {
+            { "", "" },
+            { "f", "Zg==" },
+            { "fo", "Zm8=" },
+            { "foo", "Zm9v" },
+            { "foob", "Zm9vYg==" },
+            { "fooba", "Zm9vYmE=" },
+            { "foobar", "Zm9vYmFy" }
+        };
+        boolean encoded = true;
+        boolean decoded = true;
+        for (int i = 0; i < vectors.length; i++) {
+            if (!Base64.encode(Ascii.toBytes(vectors[i][0])).equals(vectors[i][1])) {
+                encoded = false;
+            }
+            try {
+                if (!sameBytes(Ascii.toBytes(vectors[i][0]), Base64.decode(vectors[i][1]))) {
+                    decoded = false;
+                }
+            } catch (IOException e) {
+                decoded = false;
+            }
+        }
+        checkTrue("base64 encodes the RFC 4648 vectors", encoded);
+        checkTrue("base64 decodes the RFC 4648 vectors", decoded);
+
+        checkTrue("base64 omits padding when asked",
+            "Zm9vYmE".equals(Base64.encodeUnpadded(Ascii.toBytes("fooba"))));
+
+        try {
+            checkTrue("base64 decodes without padding and across whitespace",
+                sameBytes(Ascii.toBytes("fooba"), Base64.decode("Zm9v\n YmE")));
+        } catch (IOException e) {
+            fail("unpadded decode threw " + e);
+        }
+
+        checkRejected("base64 with a character outside the alphabet is refused",
+            () -> Base64.decode("Zm9v!mE="));
+        checkRejected("base64 of an impossible length is refused",
+            () -> Base64.decode("Zm9vY"));
+    }
+
+    /**
+     * The host key of the project's test container. The fingerprint is what
+     * `ssh-keygen -lf` prints for it, so the string the handset shows can be
+     * compared against the server character for character.
+     */
+    private static void hostKeyVectors() {
+        byte[] blob = hex("0000000b7373682d6564323535313900000020"
+            + "2ff01c2270598befd06f04f4c80df20da07c5a0834d13e327bc1c5eefd9bcbbf");
+        try {
+            HostKey key = HostKey.parse(blob);
+            checkTrue("host key fingerprint matches ssh-keygen -lf",
+                "SHA256:9tqjakW/Ia6U4hT3VgAv8EXXCxC1d3ez9mr5qjVTRZs".equals(key.fingerprint()));
+            checkTrue("host key renders as a known_hosts line",
+                ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC/wHCJwWYvv0G8E9MgN8g2gfFoINNE"
+                    + "+MnvBxe79m8u/").equals(key.toAuthorizedKey()));
+            checkTrue("host key exposes the 32 raw bytes",
+                key.publicKey().length == 32);
+        } catch (IOException e) {
+            fail("host key parse threw " + e);
+        }
+
+        checkRejected("a host key of the wrong algorithm is refused",
+            () -> HostKey.parse(hex("00000007" + "7373682d727361" + "00000001" + "05")));
+        checkRejected("an ssh-ed25519 key that is not 32 bytes is refused",
+            () -> HostKey.parse(hex("0000000b7373682d65643235353139" + "0000000401020304")));
+        checkRejected("a host key blob with trailing bytes is refused",
+            () -> HostKey.parse(hex("0000000b7373682d6564323535313900000020"
+                + "2ff01c2270598befd06f04f4c80df20da07c5a0834d13e327bc1c5eefd9bcbbf" + "ff")));
+    }
+
+    /**
+     * RFC 8731 section 3 and RFC 4253 section 7.2, against values computed
+     * outside the class. If the exchange hash is wrong by a byte the server's
+     * signature simply fails to verify, with nothing in the failure to say
+     * which of the eight fields was at fault — so it is worth pinning here.
+     */
+    private static void exchangeHashVectors() {
+        String clientVersion = "SSH-2.0-berryssh_0.1";
+        String serverVersion = "SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u10";
+        byte[] clientKexInit = counting(0, 20);
+        byte[] serverKexInit = counting(100, 40);
+        byte[] hostKeyBlob = hex("0000000b7373682d6564323535313900000020"
+            + "2ff01c2270598befd06f04f4c80df20da07c5a0834d13e327bc1c5eefd9bcbbf");
+        byte[] clientPublic = counting(0, 32);
+        byte[] serverPublic = counting(32, 32);
+        byte[] shared = hex("0f" + repeat("11", 31));
+
+        byte[] h = KeyExchange.exchangeHash(clientVersion, serverVersion,
+            clientKexInit, serverKexInit, hostKeyBlob, clientPublic, serverPublic, shared);
+        check("exchange hash", h,
+            "23f549f05c9e7da24577ec04c43b5e3f9bd9e9af8614dc5de961b6865fe54345");
+
+        // Half of all shared secrets have the top bit set and gain an mpint sign
+        // byte. Treating the secret as fixed-width would work about half the time.
+        byte[] highSecret = hex("f0" + repeat("22", 31));
+        check("exchange hash with a secret that needs an mpint sign byte",
+            KeyExchange.exchangeHash(clientVersion, serverVersion,
+                clientKexInit, serverKexInit, hostKeyBlob, clientPublic, serverPublic, highSecret),
+            "2c55820c96b5bc6f70336346ef164bd3b124d8b964826675ac090eda577cfcf1");
+
+        // 64 bytes crosses the one-hash boundary, which is the case the RFC's
+        // extension rule exists for and the one an implementation gets wrong.
+        check("derived key C, 64 bytes across the hash boundary",
+            KeyExchange.deriveKey(shared, h, 'C', h, 64),
+            "48f667892eda7f0cc12049bb69d17e412c994ac944879703452591036e99244e"
+                + "b34e3a9d0b578f6470cf0fb35166036b7d274527fd9981c1bd476efe0e142d61");
+        check("derived key D, 64 bytes",
+            KeyExchange.deriveKey(shared, h, 'D', h, 64),
+            "0697d95bd891623204b6e9db7d9e82573577e190653a7ed1d33835eb59a86874"
+                + "aab166381e714e2c7d978a59cf5bb2fb1590fe14a0b478247a271e8fb0f7a470");
+        check("derived key A, 16 bytes from one hash",
+            KeyExchange.deriveKey(shared, h, 'A', h, 16),
+            "132bce258cdfdb26edd5ce05dc891bc3");
+    }
+
+    private static byte[] counting(int from, int length) {
+        byte[] b = new byte[length];
+        for (int i = 0; i < length; i++) {
+            b[i] = (byte) (from + i);
+        }
+        return b;
+    }
+
+    private static String repeat(String s, int times) {
+        StringBuffer sb = new StringBuffer(s.length() * times);
+        for (int i = 0; i < times; i++) {
+            sb.append(s);
+        }
+        return sb.toString();
     }
 
     private static KexInit clientKexInit() {

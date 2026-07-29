@@ -1,26 +1,25 @@
 import berryssh.crypto.EntropyPool;
+import berryssh.protocol.HostKey;
 import berryssh.protocol.KexInit;
+import berryssh.protocol.KeyExchange;
 import berryssh.protocol.Message;
 import berryssh.protocol.Negotiation;
 import berryssh.protocol.Transport;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.Socket;
 
 /**
  * The half of the verification that needs a real OpenSSH server.
  *
  * The offline vectors prove the encodings; only a real server proves the
- * protocol. Several of these issues have no meaningful self-test — a key
- * exchange either convinces an OpenSSH server or it does not.
+ * protocol. A key exchange either convinces OpenSSH or it does not, and if the
+ * exchange hash is wrong by one byte the only symptom is a signature that will
+ * not verify — so this is where that gets settled.
  *
- * This runs against the container the project keeps for the purpose (see the
- * README), reached over a plain socket. It is host-only: `java.net` does not
- * exist in CLDC, where the same streams come from
- * `Connector.open("socket://host:port")`. Everything under test takes streams
- * rather than a socket precisely so that this substitution is the only
+ * Host-only: `java.net` does not exist in CLDC, where the same streams come
+ * from `Connector.open("socket://host:port")`. Everything under test takes
+ * streams rather than a socket precisely so that substitution is the only
  * difference between here and the device.
  */
 public class ServerTests {
@@ -41,6 +40,7 @@ public class ServerTests {
 
         System.out.println("  ..    against " + host + ":" + port);
         negotiatesWithRealServer();
+        exchangesKeysWithRealServer();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -49,63 +49,116 @@ public class ServerTests {
         }
     }
 
+    /** A connection carried far enough to be useful, with the pieces kept. */
+    private static final class Handshake {
+        Socket socket;
+        Transport transport;
+        EntropyPool random;
+        KexInit ours;
+        KexInit theirs;
+        Negotiation negotiated;
+    }
+
+    private static Handshake upToKexInit() throws IOException {
+        Handshake h = new Handshake();
+        h.socket = new Socket(host, port);
+        h.socket.setSoTimeout(15000);
+        h.transport = new Transport(h.socket.getInputStream(), h.socket.getOutputStream());
+        h.transport.exchangeVersions();
+
+        h.random = new EntropyPool();
+        h.random.seed();
+        h.ours = KexInit.client(h.random);
+        h.transport.writePacket(h.ours.payload());
+
+        h.theirs = KexInit.parse(h.transport.readMessage());
+        h.negotiated = Negotiation.between(h.ours, h.theirs);
+        return h;
+    }
+
     /**
-     * RFC 4253 sections 4.2 and 7.1 against a server that did not read our
-     * code: the identification strings have to be mutually acceptable and the
-     * negotiated set has to be the modern one, on a server that also still
-     * offers the 2011 algorithms this project exists to avoid.
+     * RFC 4253 sections 4.2 and 7.1: the identification strings have to be
+     * mutually acceptable, and the negotiated set has to be the modern one on a
+     * server that still offers the 2011 algorithms as well.
      */
     private static void negotiatesWithRealServer() throws Exception {
-        Socket socket = new Socket(host, port);
+        Handshake h = upToKexInit();
         try {
-            socket.setSoTimeout(10000);
-            InputStream in = socket.getInputStream();
-            OutputStream out = socket.getOutputStream();
-
-            Transport transport = new Transport(in, out);
-            transport.exchangeVersions();
             checkTrue("the server accepts our identification and returns its own",
-                transport.serverVersion() != null
-                    && transport.serverVersion().startsWith("SSH-2.0-"));
-            System.out.println("        server is " + transport.serverVersion());
-
-            EntropyPool random = new EntropyPool();
-            random.seed();
-            KexInit ours = KexInit.client(random);
-            transport.writePacket(ours.payload());
-
-            byte[] reply = transport.readPacket();
-            checkTrue("the server answers KEXINIT with KEXINIT",
-                (reply[0] & 0xff) == Message.KEXINIT);
-
-            KexInit theirs = KexInit.parse(reply);
-            Negotiation negotiated = Negotiation.between(ours, theirs);
+                h.transport.serverVersion() != null
+                    && h.transport.serverVersion().startsWith("SSH-2.0-"));
+            System.out.println("        server is " + h.transport.serverVersion());
 
             checkTrue("negotiated curve25519-sha256",
-                "curve25519-sha256".equals(negotiated.kex()));
+                "curve25519-sha256".equals(h.negotiated.kex()));
             checkTrue("negotiated ssh-ed25519",
-                "ssh-ed25519".equals(negotiated.hostKey()));
+                "ssh-ed25519".equals(h.negotiated.hostKey()));
             checkTrue("negotiated chacha20-poly1305@openssh.com both ways",
-                "chacha20-poly1305@openssh.com".equals(negotiated.cipherClientToServer())
-                    && "chacha20-poly1305@openssh.com".equals(negotiated.cipherServerToClient()));
+                "chacha20-poly1305@openssh.com".equals(h.negotiated.cipherClientToServer())
+                    && "chacha20-poly1305@openssh.com".equals(h.negotiated.cipherServerToClient()));
             checkTrue("negotiated no compression",
-                "none".equals(negotiated.compressionClientToServer())
-                    && "none".equals(negotiated.compressionServerToClient()));
+                "none".equals(h.negotiated.compressionClientToServer())
+                    && "none".equals(h.negotiated.compressionServerToClient()));
 
             // The container deliberately still offers the 2011 algorithms, so
             // this confirms the modern set was a choice rather than the only
             // thing on the table.
-            boolean serverStillOffersLegacy = false;
-            for (int i = 0; i < theirs.kexAlgorithms().length; i++) {
-                if ("diffie-hellman-group14-sha1".equals(theirs.kexAlgorithms()[i])) {
-                    serverStillOffersLegacy = true;
+            boolean legacyOffered = false;
+            for (int i = 0; i < h.theirs.kexAlgorithms().length; i++) {
+                if ("diffie-hellman-group14-sha1".equals(h.theirs.kexAlgorithms()[i])) {
+                    legacyOffered = true;
                 }
             }
             checkTrue("the server also offered the legacy key exchange, and we did not take it",
-                serverStillOffersLegacy);
+                legacyOffered);
         } finally {
-            socket.close();
+            h.socket.close();
         }
+    }
+
+    /**
+     * RFC 8731. The server signs the exchange hash it computed; our signature
+     * check passing means our reconstruction of it agrees with the server's
+     * across all eight fields, byte for byte. There is no weaker way to pass.
+     */
+    private static void exchangesKeysWithRealServer() throws Exception {
+        Handshake h = upToKexInit();
+        try {
+            KeyExchange.Result result = KeyExchange.run(h.transport, h.ours, h.theirs, h.random);
+
+            checkTrue("the server's signature over the exchange hash verifies",
+                result.exchangeHash().length == 32);
+
+            HostKey key = result.hostKey();
+            System.out.println("        host key is " + key.fingerprint());
+            checkTrue("the host key is ssh-ed25519 and 32 bytes",
+                key.publicKey().length == 32);
+            checkTrue("the fingerprint is the one ssh-keygen prints for this server",
+                "SHA256:9tqjakW/Ia6U4hT3VgAv8EXXCxC1d3ez9mr5qjVTRZs".equals(key.fingerprint()));
+
+            // Derivation cannot be checked against the server until the cipher
+            // is in place, but its shape can: the labels must produce distinct
+            // material of the length asked for.
+            byte[] sessionId = result.exchangeHash();
+            byte[] keyOut = result.deriveKey('C', sessionId, 64);
+            byte[] keyIn = result.deriveKey('D', sessionId, 64);
+            checkTrue("derives 64 bytes per direction, and the directions differ",
+                keyOut.length == 64 && keyIn.length == 64 && !sameBytes(keyOut, keyIn));
+        } finally {
+            h.socket.close();
+        }
+    }
+
+    private static boolean sameBytes(byte[] a, byte[] b) {
+        if (a.length != b.length) {
+            return false;
+        }
+        for (int i = 0; i < a.length; i++) {
+            if (a[i] != b[i]) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static void checkTrue(String name, boolean condition) {
