@@ -4,7 +4,9 @@ import berryssh.protocol.Base64;
 import berryssh.protocol.HostKey;
 import berryssh.protocol.KexInit;
 import berryssh.protocol.KeyExchange;
+import berryssh.crypto.Ed25519;
 import berryssh.protocol.KnownHosts;
+import berryssh.protocol.OpenSshKey;
 import berryssh.protocol.PacketCipher;
 import berryssh.protocol.Negotiation;
 import berryssh.protocol.SshException;
@@ -61,6 +63,7 @@ public class TransportTests {
         utf8Vectors();
         knownHostsPolicy();
         savedConnections();
+        opensshPrivateKeys();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -809,6 +812,96 @@ public class TransportTests {
         // read with its fields in the wrong order.
         checkRejected("a saved connection in an unknown format is refused",
             () -> Profile.decode(hex("0000009900000000")));
+    }
+
+    /**
+     * The OpenSSH private key file, which is how a key gets onto the handset.
+     *
+     * The container is built here from a published seed rather than a key file
+     * being committed: a repository is the wrong place for a private key even
+     * a worthless one, and building it means every byte of the format is
+     * stated rather than assumed. The parser was separately checked against a
+     * real `ssh-keygen -t ed25519` file, whose derived public key it reproduced
+     * exactly.
+     */
+    private static void opensshPrivateKeys() {
+        byte[] seed = hex("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7");
+        try {
+            String pem = opensshKey(seed, "none");
+            check("an OpenSSH key file yields its seed",
+                OpenSshKey.readEd25519Seed(pem), toHex(seed));
+
+            checkTrue("and the authorized_keys line derived from it is right",
+                OpenSshKey.authorizedKey(seed).indexOf(
+                    "AAAAC3NzaC1lZDI1NTE5AAAAIPxRzY5iGKGjjaR+0AIw8FgIFu0TujMDrF3rkRVIkIAl") > 0);
+
+            // Whitespace and line breaks vary with however it was pasted.
+            checkTrue("a key that lost its line breaks still reads",
+                sameBytes(seed, OpenSshKey.readEd25519Seed(collapse(pem))));
+        } catch (IOException e) {
+            fail("reading an OpenSSH key threw " + e);
+        }
+
+        checkRejected("something that is not a key file is refused",
+            () -> OpenSshKey.readEd25519Seed("hello"));
+        // An encrypted key has to say so. Failing with something about a bad
+        // key would send someone looking in the wrong place entirely.
+        checkRejected("an encrypted key is refused, by name",
+            () -> OpenSshKey.readEd25519Seed(opensshKey(seed, "aes256-ctr")));
+        checkRejected("a key whose halves disagree is refused",
+            () -> OpenSshKey.readEd25519Seed(corrupt(opensshKey(seed, "none"))));
+    }
+
+    /** Builds an openssh-key-v1 container around a seed. */
+    private static String opensshKey(byte[] seed, String cipher) {
+        byte[] publicKey = Ed25519.publicKey(seed);
+        byte[] secret = new byte[64];
+        System.arraycopy(seed, 0, secret, 0, 32);
+        System.arraycopy(publicKey, 0, secret, 32, 32);
+
+        WireWriter keyBlob = new WireWriter(64);
+        keyBlob.writeAsciiString("ssh-ed25519");
+        keyBlob.writeString(publicKey);
+
+        WireWriter section = new WireWriter(256);
+        section.writeUint32(0x01020304);
+        section.writeUint32(0x01020304);
+        section.writeAsciiString("ssh-ed25519");
+        section.writeString(publicKey);
+        section.writeString(secret);
+        section.writeAsciiString("test");
+
+        WireWriter w = new WireWriter(512);
+        w.writeRaw(Ascii.toBytes("openssh-key-v1"));
+        w.writeByte(0);
+        w.writeAsciiString(cipher);
+        w.writeAsciiString("none");
+        w.writeString(new byte[0]);
+        w.writeUint32(1);
+        w.writeString(keyBlob.toByteArray());
+        w.writeString(section.toByteArray());
+
+        return "-----BEGIN OPENSSH PRIVATE KEY-----\n"
+            + Base64.encode(w.toByteArray())
+            + "\n-----END OPENSSH PRIVATE KEY-----\n";
+    }
+
+    private static String collapse(String pem) {
+        StringBuffer sb = new StringBuffer();
+        for (int i = 0; i < pem.length(); i++) {
+            char c = pem.charAt(i);
+            sb.append(c == '\n' ? ' ' : c);
+        }
+        return sb.toString();
+    }
+
+    /** Flips a bit inside the base64 body, leaving the markers intact. */
+    private static String corrupt(String pem) {
+        int begin = pem.indexOf("-----\n") + 6;
+        StringBuffer sb = new StringBuffer(pem);
+        char c = sb.charAt(begin + 200);
+        sb.setCharAt(begin + 200, c == 'A' ? 'B' : 'A');
+        return sb.toString();
     }
 
     private static byte[] slice(byte[] b, int offset, int length) {

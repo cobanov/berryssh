@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
-# A throwaway SSH server that asks to rekey almost immediately.
+# A throwaway SSH server for the tests that need the server configured.
 #
-# OpenSSH requests a rekey after about a gigabyte or an hour. Waiting an hour is
-# not a test, so this one is built with RekeyLimit at 64 KB, which makes a few
-# hundred kilobytes of output force ten of them.
+# Two things the shared container cannot provide. It rekeys every 64 KB, so the
+# rekey path can be exercised in seconds rather than the hour OpenSSH would
+# otherwise take. And it authorises a known test key, so public key
+# authentication can be confirmed end to end.
 #
 # Deliberately separate from the `bbssh` container on port 2222: that one is
-# what the handset connects to, and restarting it to change its configuration
-# would interrupt whoever is using it.
+# what the handset connects to, and reconfiguring or restarting it would
+# interrupt whoever is using it.
+#
+# The authorised key is the RFC 8032 test vector 3 seed, which is published in
+# the RFC and used in this project's crypto vectors. It is a test value in the
+# most literal sense and secures nothing.
 #
 #   tools/rekey-server.sh          # build and start on 2223
 #   tools/rekey-server.sh stop
@@ -31,11 +36,18 @@ if [ "${1:-start}" = "stop" ]; then
 fi
 
 build="$(mktemp -d)"
-cat > "$build/Dockerfile" <<'EOF'
+# Public half of the RFC 8032 test vector 3 seed.
+AUTHORIZED="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPxRzY5iGKGjjaR+0AIw8FgIFu0TujMDrF3rkRVIkIAl berryssh-test-vector"
+
+cat > "$build/Dockerfile" <<EOF
 FROM bbssh-sshd:latest
-RUN printf '\nRekeyLimit 64K none\n' >> /etc/ssh/sshd_config.d/00-bbssh-legacy.conf \
- && ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N "" -q \
- && printf '\nHostKey /etc/ssh/ssh_host_ed25519_key\n' >> /etc/ssh/sshd_config.d/00-bbssh-legacy.conf
+RUN printf '\nRekeyLimit 64K none\n' >> /etc/ssh/sshd_config.d/00-bbssh-legacy.conf \\
+ && ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N "" -q \\
+ && printf '\nHostKey /etc/ssh/ssh_host_ed25519_key\n' >> /etc/ssh/sshd_config.d/00-bbssh-legacy.conf \\
+ && mkdir -p /home/bb/.ssh \\
+ && echo '$AUTHORIZED' > /home/bb/.ssh/authorized_keys \\
+ && chown -R bb:bb /home/bb/.ssh \\
+ && chmod 700 /home/bb/.ssh && chmod 600 /home/bb/.ssh/authorized_keys
 EOF
 
 echo "==> building $IMAGE"
