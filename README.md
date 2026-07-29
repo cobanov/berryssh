@@ -77,7 +77,7 @@ Then open the printed URL in the device's native browser, over Wi-Fi.
 
 ## Verification
 
-`spike2/run.sh` compiles the crypto against the CLDC bootclasspath at
+`spike2/run.sh` compiles the client against the CLDC bootclasspath at
 `-source 1.3`, then runs its test vectors on the host JVM. Compiling under the
 device's constraints proves the code will run there; executing on the host
 proves it is correct. Neither half needs the device.
@@ -86,9 +86,15 @@ proves it is correct. Neither half needs the device.
 spike2/run.sh
 ```
 
-Current vectors: FIPS 180-4 for SHA-256 and SHA-512, RFC 8439 §2.4.2 / §2.5.2 /
+**Crypto**: FIPS 180-4 for SHA-256 and SHA-512, RFC 8439 §2.4.2 / §2.5.2 /
 §2.8.2 for ChaCha20, Poly1305 and the AEAD construction, RFC 7748 §5.2 / §6.1
 for X25519, and RFC 8032 §7.1 plus negative cases for Ed25519. 28 in total.
+
+**Transport**: RFC 4251 §5 for the wire types and RFC 4253 §6 for the packet
+framing, plus the version exchange and the paths that have to reject malformed
+input. 47 in total. They run under a Turkish default locale, which is the
+device's own and the setting most likely to break protocol code without raising
+an error anywhere.
 
 ## Measured on the device
 
@@ -111,7 +117,7 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
     lib/            dependency fetcher
     ssh/src/        the client library
     spike1/         device capability probe
-    spike2/         crypto test vectors
+    spike2/         test vectors, run on the host
     tools/          OTA server
 
 ## Status
@@ -120,7 +126,8 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
 - [x] SHA-256, SHA-512, ChaCha20, Poly1305, ChaCha20-Poly1305 AEAD
 - [x] X25519 key agreement
 - [x] Ed25519 signature verification, and SHA-512
-- [ ] SSH transport: version exchange, binary packet protocol, KEXINIT
+- [x] SSH transport: version exchange and the binary packet protocol
+- [ ] KEXINIT algorithm negotiation, and the key exchange
 - [ ] `chacha20-poly1305@openssh.com` packet layer
 - [ ] User authentication
 - [ ] Channels, `pty-req`, shell

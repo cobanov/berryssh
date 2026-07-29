@@ -1,0 +1,244 @@
+package berryssh.protocol;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.util.Random;
+
+/**
+ * The RFC 4253 transport layer: the version exchange, and the binary packet
+ * protocol that frames everything above it.
+ *
+ * This class deliberately knows nothing about MIDP. It is driven through plain
+ * java.io streams so the whole framing layer can be exercised on the host
+ * against a pair of byte arrays, with no device and no server involved.
+ *
+ * The packets are still in the clear here. Once the key exchange has run,
+ * chacha20-poly1305 replaces both the padding rules and the length field's
+ * encoding, because that cipher encrypts the length separately — so this is a
+ * seam the cipher work will reopen, not a finished layer.
+ *
+ * Written for -source 1.3: no generics, no enhanced for, no StringBuilder.
+ */
+public final class Transport {
+
+    public static final String SOFTWARE_VERSION = "berryssh_0.1";
+
+    private static final String IDENTIFICATION = "SSH-2.0-" + SOFTWARE_VERSION;
+
+    /** RFC 4253 section 4.2: the identification line including CR LF is at most 255 bytes. */
+    private static final int MAX_VERSION_LINE = 255;
+
+    /** A server may precede its identification with banner text; it may not do so forever. */
+    private static final int MAX_BANNER_LINES = 1024;
+
+    /**
+     * RFC 4253 requires 35000 bytes to be accepted. The bound is generous
+     * rather than tight because it exists to stop a hostile length field from
+     * turning into an allocation, not to constrain a real server.
+     */
+    private static final int MAX_PACKET = 256 * 1024;
+
+    /** Smallest legal packet, counting the length field itself. */
+    private static final int MIN_PACKET = 16;
+
+    private final InputStream in;
+    private final OutputStream out;
+
+    /**
+     * Padding only has to be unpredictable enough to satisfy RFC 4253's SHOULD.
+     * It is not key material: before the key exchange it travels in the clear
+     * with nothing to hide, and afterwards the AEAD covers it. Generating a
+     * private key needs a real entropy source, which this is not.
+     */
+    private final Random paddingSource = new Random(System.currentTimeMillis());
+
+    /**
+     * Eight until a cipher is negotiated. RFC 4253 sets the alignment to the
+     * cipher's block size, or 8 for a stream cipher and for the null cipher.
+     */
+    private int blockSize = 8;
+
+    private String clientVersion;
+    private String serverVersion;
+    private long sendSequence;
+    private long receiveSequence;
+
+    public Transport(InputStream in, OutputStream out) {
+        this.in = in;
+        this.out = out;
+    }
+
+    /** The client's identification line, without CR LF, as it feeds the exchange hash. */
+    public String clientVersion() {
+        return clientVersion;
+    }
+
+    /** The server's identification line, without CR LF, as it feeds the exchange hash. */
+    public String serverVersion() {
+        return serverVersion;
+    }
+
+    public long sendSequence() {
+        return sendSequence;
+    }
+
+    public long receiveSequence() {
+        return receiveSequence;
+    }
+
+    /**
+     * Sends our identification line and reads the peer's.
+     *
+     * Both strings are kept because the key exchange hashes them: getting them
+     * back by reconstruction later would risk a mismatch over CR LF or over a
+     * banner line, and the hash would fail with nothing to point at.
+     */
+    public void exchangeVersions() throws IOException {
+        clientVersion = IDENTIFICATION;
+        out.write(Ascii.toBytes(clientVersion));
+        out.write('\r');
+        out.write('\n');
+        out.flush();
+
+        // RFC 4253 section 4.2 lets a server send any number of other lines
+        // first. Everything before the SSH- line is banner text and is dropped.
+        String line = null;
+        for (int i = 0; i < MAX_BANNER_LINES; i++) {
+            line = readLine();
+            if (line.startsWith("SSH-")) {
+                break;
+            }
+            line = null;
+        }
+        if (line == null) {
+            throw new SshException("no identification string after " + MAX_BANNER_LINES + " lines");
+        }
+
+        // "1.99" means a server that also speaks 2.0.
+        if (!line.startsWith("SSH-2.0-") && !line.startsWith("SSH-1.99-")) {
+            throw new SshException("unsupported protocol version: " + line);
+        }
+        serverVersion = line;
+    }
+
+    /**
+     * Frames a payload and writes it.
+     *
+     * RFC 4253 section 6: the length field, the padding-length byte, the
+     * payload and the padding together come to a multiple of the block size,
+     * with at least 4 bytes of padding and at least 16 bytes in total.
+     */
+    public void writePacket(byte[] payload) throws IOException {
+        int unpadded = 5 + payload.length;
+        int padLength = blockSize - (unpadded % blockSize);
+        if (padLength < 4) {
+            padLength += blockSize;
+        }
+        while (unpadded + padLength < MIN_PACKET) {
+            padLength += blockSize;
+        }
+
+        int packetLength = 1 + payload.length + padLength;
+        byte[] packet = new byte[4 + packetLength];
+        packet[0] = (byte) (packetLength >>> 24);
+        packet[1] = (byte) (packetLength >>> 16);
+        packet[2] = (byte) (packetLength >>> 8);
+        packet[3] = (byte) packetLength;
+        packet[4] = (byte) padLength;
+        System.arraycopy(payload, 0, packet, 5, payload.length);
+        fillRandom(packet, 5 + payload.length, padLength);
+
+        out.write(packet, 0, packet.length);
+        out.flush();
+        sendSequence = (sendSequence + 1) & 0xffffffffL;
+    }
+
+    /** Reads one packet and returns its payload. */
+    public byte[] readPacket() throws IOException {
+        byte[] header = new byte[4];
+        readFully(header, 0, 4);
+        long packetLength = ((long) (header[0] & 0xff) << 24)
+                          | ((long) (header[1] & 0xff) << 16)
+                          | ((long) (header[2] & 0xff) << 8)
+                          | (long) (header[3] & 0xff);
+
+        // Every check here happens before the allocation on the next line.
+        if (packetLength < MIN_PACKET - 4) {
+            throw new SshException("packet of " + packetLength + " bytes is below the minimum");
+        }
+        if (packetLength > MAX_PACKET) {
+            throw new SshException("packet of " + packetLength + " bytes is implausible");
+        }
+        if ((packetLength + 4) % blockSize != 0) {
+            throw new SshException("packet is not a whole number of " + blockSize + "-byte blocks");
+        }
+
+        byte[] body = new byte[(int) packetLength];
+        readFully(body, 0, body.length);
+
+        int padLength = body[0] & 0xff;
+        if (padLength < 4 || padLength > body.length - 1) {
+            throw new SshException("padding of " + padLength + " bytes does not fit the packet");
+        }
+
+        byte[] payload = new byte[body.length - padLength - 1];
+        System.arraycopy(body, 1, payload, 0, payload.length);
+        receiveSequence = (receiveSequence + 1) & 0xffffffffL;
+        return payload;
+    }
+
+    /**
+     * Reads one CR-LF-terminated line, a byte at a time.
+     *
+     * Reading ahead in blocks would swallow the first packet, and CLDC has no
+     * BufferedInputStream to push the excess back into. The 255-byte cap counts
+     * only what is kept, which is marginally more tolerant than the RFC — worth
+     * it to not reject a server over its line ending.
+     */
+    private String readLine() throws IOException {
+        byte[] line = new byte[MAX_VERSION_LINE];
+        int n = 0;
+        for (;;) {
+            int c = in.read();
+            if (c < 0) {
+                throw new SshException("connection closed during the version exchange");
+            }
+            if (c == '\n') {
+                break;
+            }
+            if (n == line.length) {
+                throw new SshException("version line longer than " + MAX_VERSION_LINE + " bytes");
+            }
+            line[n++] = (byte) c;
+        }
+        if (n > 0 && line[n - 1] == '\r') {
+            n--;
+        }
+        return Ascii.fromBytes(line, 0, n);
+    }
+
+    private void readFully(byte[] b, int offset, int length) throws IOException {
+        while (length > 0) {
+            int n = in.read(b, offset, length);
+            if (n < 0) {
+                throw new SshException("connection closed mid-packet");
+            }
+            offset += n;
+            length -= n;
+        }
+    }
+
+    /** CLDC's Random has no nextBytes, so the words are unpacked by hand. */
+    private void fillRandom(byte[] b, int offset, int length) {
+        while (length > 0) {
+            int word = paddingSource.nextInt();
+            int take = length < 4 ? length : 4;
+            for (int i = 0; i < take; i++) {
+                b[offset + i] = (byte) (word >>> (8 * i));
+            }
+            offset += take;
+            length -= take;
+        }
+    }
+}
