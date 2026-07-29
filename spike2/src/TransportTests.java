@@ -3,6 +3,7 @@ import berryssh.protocol.Base64;
 import berryssh.protocol.HostKey;
 import berryssh.protocol.KexInit;
 import berryssh.protocol.KeyExchange;
+import berryssh.protocol.KnownHosts;
 import berryssh.protocol.PacketCipher;
 import berryssh.protocol.Negotiation;
 import berryssh.protocol.SshException;
@@ -57,6 +58,7 @@ public class TransportTests {
         packetCipherVectors();
         encryptedFraming();
         utf8Vectors();
+        knownHostsPolicy();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -697,6 +699,62 @@ public class TransportTests {
             "a�b".equals(Utf8.decode(hex("61ff62"))));
         checkTrue("a truncated sequence at the end does not run off the array",
             Utf8.decode(hex("61c3")).length() == 2);
+    }
+
+    /**
+     * The trust decision, away from RMS.
+     *
+     * This is the half of host authentication the signature check cannot do.
+     * Verifying the signature proves the server holds the key it showed us;
+     * only this says whether it is the same key as last time.
+     */
+    private static void knownHostsPolicy() {
+        byte[] blobA = hex("0000000b7373682d6564323535313900000020"
+            + "2ff01c2270598befd06f04f4c80df20da07c5a0834d13e327bc1c5eefd9bcbbf");
+        byte[] blobB = hex("0000000b7373682d6564323535313900000020"
+            + "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025");
+
+        try {
+            HostKey keyA = HostKey.parse(blobA);
+            HostKey keyB = HostKey.parse(blobB);
+            MemoryStore store = new MemoryStore();
+
+            checkTrue("an unseen host is unknown",
+                KnownHosts.check(store, "example.org", 22, keyA) == KnownHosts.UNKNOWN);
+
+            KnownHosts.accept(store, "example.org", 22, keyA);
+            checkTrue("an accepted host matches next time",
+                KnownHosts.check(store, "example.org", 22, keyA) == KnownHosts.MATCHED);
+
+            checkTrue("a different key on the same host is a mismatch",
+                KnownHosts.check(store, "example.org", 22, keyB) == KnownHosts.CHANGED);
+
+            // The port is part of the identity, as it is in OpenSSH's
+            // known_hosts: two servers behind one address are two hosts.
+            checkTrue("the same address on another port is a different host",
+                KnownHosts.check(store, "example.org", 2222, keyA) == KnownHosts.UNKNOWN);
+
+            checkTrue("the first-contact prompt carries the comparable fingerprint",
+                KnownHosts.firstContactPrompt("example.org", 22, keyA)
+                    .indexOf("SHA256:9tqjakW/Ia6U4hT3VgAv8EXXCxC1d3ez9mr5qjVTRZs") >= 0);
+            checkTrue("the mismatch warning is a statement, not a question",
+                KnownHosts.mismatchWarning("example.org", 22, keyB).indexOf('?') < 0);
+        } catch (IOException e) {
+            fail("known hosts threw " + e);
+        }
+    }
+
+    /** Stands in for RMS, which exists only on the device. */
+    private static final class MemoryStore implements KnownHosts.Store {
+        private final java.util.Hashtable entries = new java.util.Hashtable();
+
+        public byte[] lookup(String host, int port) {
+            return (byte[]) entries.get(host + ":" + port);
+        }
+
+        public void store(String host, int port, byte[] blob) {
+            entries.put(host + ":" + port, blob);
+        }
     }
 
     private static byte[] slice(byte[] b, int offset, int length) {
