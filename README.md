@@ -41,6 +41,7 @@ No BlackBerry SDK is involved. Dependencies are fetched, not vendored:
 
 ```sh
 lib/fetch.sh          # MIDP/CLDC API stubs and ProGuard, from Maven Central
+tools/make_atlas.sh   # regenerate the font atlases (only if the charset changes)
 ./build.sh            # -> out/berryssh.jad + berryssh.jar
 ```
 
@@ -96,7 +97,8 @@ framing and §7.1 for algorithm negotiation, RFC 8731 §3 for the exchange hash
 and RFC 4253 §7.2 for key derivation, plus base64, host key parsing, the
 version exchange, the chacha20-poly1305 packet layer, UTF-8, host key trust,
 saved connections and the paths that have to reject malformed input. 106 in
-total. They run under a Turkish default locale, which is the device's own and
+total. A further 39 cover the terminal: escape sequences, key dispatch,
+scrollback and the character-to-glyph mapping. They run under a Turkish default locale, which is the device's own and
 the setting most likely to break protocol code without raising an error
 anywhere.
 
@@ -136,7 +138,7 @@ large here. An 8×14 cell gives the 60×25 terminal this screen should have.
     lib/            dependency fetcher
     ssh/src/        the client library and the MIDlet
     spike1/         device capability probe
-    ssh/res/        font atlases
+    ssh/res/        generated font atlases
     spike2/         test vectors, run on the host
     tools/          OTA server
 
@@ -176,8 +178,15 @@ What is taken, or planned to be:
 - **`BitmapFont`** — the subpixel-antialiased bitmap font renderer, derived from
   Roar Lauritzsen's LCDFont. Its atlas layout and `drawRGB` approach map
   directly onto MIDP.
-- **Font atlases** — the Bitstream Vera Sans Mono and Anonymous renderings.
-  Their proprietary siblings (Courier New, Lucida Console) are not used.
+- **Font atlases** — no longer. The atlases that came across covered U+0020 to
+  U+00FF and nothing else, which left Turkish `ğ ı ş İ` and the whole
+  box-drawing range without glyphs. They are generated now, by
+  `tools/make_atlas.sh`, from DejaVu Sans Mono — the continuation of the same
+  Bitstream Vera family, whose licence permits redistributing what is rendered
+  from it. The monospace fonts already on a Mac all cover what is needed and
+  none may be used here: baking Menlo, Monaco or Courier New into a GPL project
+  would redistribute a derivative of a proprietary typeface, which is what
+  leaving BBSSH's Courier New atlases behind was avoiding.
 
 A verified copy of BBSSH, including binaries that survive nowhere else, is
 preserved at [cobanov/bbssh-archive](https://github.com/cobanov/bbssh-archive).

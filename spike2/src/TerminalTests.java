@@ -1,4 +1,5 @@
 import berryssh.device.Keyboard;
+import berryssh.terminal.BitmapFont;
 import berryssh.terminal.VT320;
 
 import java.io.IOException;
@@ -31,6 +32,7 @@ public class TerminalTests {
         sendsKeys();
         dispatchesKeys();
         keepsScrollback();
+        mapsCharactersToGlyphs();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -191,6 +193,60 @@ public class TerminalTests {
         // this the one letter of the alphabet that stopped working.
         checkTrue("Ctrl-I is Tab under any locale", Keyboard.controlOf('i') == 9);
         checkTrue("Ctrl-I is Tab from the capital too", Keyboard.controlOf('I') == 9);
+    }
+
+    /**
+     * The character-to-cell mapping, which is what was wrong.
+     *
+     * The arithmetic this replaced assumed a contiguous Latin-1 layout, so it
+     * could not distinguish a character it had a glyph for from one it did not:
+     * Turkish letters above U+00FF resolved to some empty cell and drew
+     * nothing, with no way to tell that from a space.
+     */
+    private static void mapsCharactersToGlyphs() {
+        checkTrue("space is the first cell", BitmapFont.indexOf(' ') == 0);
+        checkTrue("ASCII is contiguous from there",
+            BitmapFont.indexOf('A') == 'A' - ' ' && BitmapFont.indexOf('~') == '~' - ' ');
+
+        // The letters that were missing. Each must now have a cell, and each
+        // must have its own.
+        char[] turkish = { 'ç', 'Ç', 'ö', 'Ö', 'ü', 'Ü', 'ğ', 'Ğ', 'ı', 'İ', 'ş', 'Ş' };
+        boolean allMapped = true;
+        for (int i = 0; i < turkish.length; i++) {
+            if (BitmapFont.indexOf(turkish[i]) < 0) {
+                allMapped = false;
+            }
+            for (int j = i + 1; j < turkish.length; j++) {
+                if (BitmapFont.indexOf(turkish[i]) == BitmapFont.indexOf(turkish[j])) {
+                    allMapped = false;
+                }
+            }
+        }
+        checkTrue("every Turkish letter has a cell of its own", allMapped);
+
+        // Box drawing, which is most of what a terminal UI puts on screen.
+        checkTrue("box drawing is mapped",
+            BitmapFont.indexOf('─') >= 0 && BitmapFont.indexOf('│') >= 0
+                && BitmapFont.indexOf('┌') >= 0 && BitmapFont.indexOf('┼') >= 0);
+        checkTrue("block elements are mapped", BitmapFont.indexOf('█') >= 0);
+
+        // Control codes and anything outside the ranges must be reported as
+        // absent rather than resolved to a cell that happens to be in bounds.
+        checkTrue("control codes have no cell",
+            BitmapFont.indexOf((char) 7) < 0 && BitmapFont.indexOf((char) 27) < 0);
+        checkTrue("C1 controls have no cell", BitmapFont.indexOf((char) 0x85) < 0);
+        checkTrue("a character outside the ranges has no cell",
+            BitmapFont.indexOf('\u4e00') < 0 && BitmapFont.indexOf('\u0400') < 0);
+
+        // Every mapped character has to land inside the atlas the layout claims.
+        boolean inBounds = true;
+        for (int c = 0; c < 0x3000; c++) {
+            int index = BitmapFont.indexOf((char) c);
+            if (index >= BitmapFont.layoutSize()) {
+                inBounds = false;
+            }
+        }
+        checkTrue("no character maps past the end of the layout", inBounds);
     }
 
     /**

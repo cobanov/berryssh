@@ -28,20 +28,37 @@ import javax.microedition.lcdui.Image;
  */
 public final class BitmapFont {
 
-    /** Everything below the space is a control code and is not in the atlas. */
-    private static final int FIRST_PRINTABLE = 33;
-
-    /** 127..159 are C1 controls, also absent. */
-    private static final int C1_START = 127;
-    private static final int C1_END = 159;
-
-    /** A soft hyphen, absent for the same reason. */
-    private static final int SOFT_HYPHEN = 173;
+    /**
+     * What the atlas contains, as inclusive ranges in cell order.
+     *
+     * This has to stay identical to the table in tools/MakeAtlas.java, which
+     * lays the atlas out from it. A character's cell is its position in this
+     * sequence, so inserting a range in the middle renumbers everything after
+     * it and both sides must move together.
+     *
+     * An explicit table rather than arithmetic, because the arithmetic that
+     * came before assumed a contiguous Latin-1 layout and therefore could not
+     * tell a character it had no glyph for from one it did. Turkish letters
+     * above U+00FF mapped to whatever cell the sum landed on, which was empty,
+     * so they drew nothing and nothing said why.
+     */
+    private static final int[] RANGES = {
+        0x0020, 0x007E,   // ASCII printable
+        0x00A0, 0x00FF,   // Latin-1 supplement: covers c-cedilla, o and u umlaut
+        0x011E, 0x011F,   // G-breve
+        0x0130, 0x0131,   // dotted and dotless I
+        0x015E, 0x015F,   // S-cedilla
+        0x2500, 0x257F,   // box drawing, which is most of what a terminal UI draws
+        0x2580, 0x259F    // block elements
+    };
 
     private final int cellWidth;
     private final int cellHeight;
     private final int imageWidth;
     private final int columns;
+
+    /** How many cells the atlas actually holds glyphs for. */
+    private final int glyphs;
 
     /**
      * The atlas as it was drawn: white on black, with the red, green and blue
@@ -58,6 +75,7 @@ public final class BitmapFont {
 
     private int[] current;
     private long currentColours = -1;
+    private int foreground = 0xffffff;
     private int fgRed, fgGreen, fgBlue, bgRed, bgGreen, bgBlue;
 
     private BitmapFont(Image atlas, int cellWidth, int cellHeight) {
@@ -71,7 +89,16 @@ public final class BitmapFont {
         coloured = new int[pixels];
         atlas.getRGB(monochrome, 0, imageWidth, 0, 0, imageWidth, atlas.getHeight());
 
-        cachedFor = new long[columns * (atlas.getHeight() / cellHeight) + 1];
+        int cells = columns * (atlas.getHeight() / cellHeight);
+        int described = 0;
+        for (int i = 0; i < RANGES.length; i += 2) {
+            described += RANGES[i + 1] - RANGES[i] + 1;
+        }
+        // The table describes the atlas; if the file is smaller than the table
+        // says, trusting the table would read past the end of the image.
+        this.glyphs = described < cells ? described : cells;
+
+        cachedFor = new long[this.glyphs + 1];
         for (int i = 0; i < cachedFor.length; i++) {
             cachedFor[i] = -1;
         }
@@ -124,6 +151,10 @@ public final class BitmapFont {
      * pairs, which is what makes that cache worth having.
      */
     public void setColours(int foreground, int background) {
+        // Kept whatever branch is taken: the missing-glyph box is drawn with
+        // the graphics context's own colour, and the fast path below returns
+        // before the components are unpacked.
+        this.foreground = foreground;
         if (foreground == 0xffffff && background == 0x000000) {
             current = monochrome;
             return;
@@ -149,12 +180,17 @@ public final class BitmapFont {
     }
 
     /**
-     * Draws one character. Anything with no glyph in the atlas draws nothing,
-     * which is what a terminal should do with a control code.
+     * Draws one character.
+     *
+     * A character the atlas has no glyph for gets a hollow box rather than
+     * nothing. A hole in a line of text is indistinguishable from a space,
+     * which is exactly how the missing Turkish letters went unnoticed until a
+     * terminal UI made the gaps obvious.
      */
     public void drawChar(Graphics g, char c, int x, int y) {
         int index = glyphIndex(c);
         if (index < 0) {
+            drawMissing(g, x, y);
             return;
         }
         int offset = (index / columns) * cellHeight * imageWidth
@@ -174,27 +210,47 @@ public final class BitmapFont {
     }
 
     /**
-     * Maps a character to its cell, or -1 if the atlas has no glyph for it.
+     * The cell a character occupies in the layout, or -1 if it has none.
      *
-     * The atlas omits the control ranges rather than leaving them blank, so
-     * every character above a gap sits earlier in the grid than its code would
-     * suggest and the gaps have to be subtracted in order.
+     * Static and free of the loaded atlas so the mapping can be checked on the
+     * host, where an Image cannot be constructed. The instance method below
+     * adds the only thing that needs the atlas: whether that cell exists in the
+     * file that was actually loaded.
      */
+    public static int indexOf(char c) {
+        int at = 0;
+        for (int i = 0; i < RANGES.length; i += 2) {
+            if (c >= RANGES[i] && c <= RANGES[i + 1]) {
+                return at + (c - RANGES[i]);
+            }
+            at += RANGES[i + 1] - RANGES[i] + 1;
+        }
+        return -1;
+    }
+
+    /** How many cells the layout describes, whatever the atlas holds. */
+    public static int layoutSize() {
+        int total = 0;
+        for (int i = 0; i < RANGES.length; i += 2) {
+            total += RANGES[i + 1] - RANGES[i] + 1;
+        }
+        return total;
+    }
+
     private int glyphIndex(char c) {
-        if (c < FIRST_PRINTABLE || (c >= C1_START && c <= C1_END) || c == SOFT_HYPHEN) {
-            return -1;
-        }
-        int index = c - FIRST_PRINTABLE;
-        if (c > C1_END) {
-            index -= (C1_END - C1_START + 1);
-        }
-        if (c > SOFT_HYPHEN) {
-            index -= 1;
-        }
-        if (index >= cachedFor.length) {
-            return -1;
-        }
-        return index;
+        int index = indexOf(c);
+        return (index >= 0 && index < glyphs) ? index : -1;
+    }
+
+    /**
+     * A hollow box, for a character with no glyph.
+     *
+     * Drawn rather than looked up, so it exists whatever the atlas contains —
+     * including when the atlas is the thing that is wrong.
+     */
+    private void drawMissing(Graphics g, int x, int y) {
+        g.setColor(foreground);
+        g.drawRect(x + 1, y + 2, cellWidth - 3, cellHeight - 5);
     }
 
     /**
