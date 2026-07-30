@@ -113,7 +113,7 @@ spike2/run.sh
 **Crypto**: FIPS 180-4 for SHA-256 and SHA-512, RFC 8439 §2.4.2 / §2.5.2 /
 §2.8.2 for ChaCha20, Poly1305 and the AEAD construction, RFC 7748 §5.2 / §6.1
 for X25519, RFC 8032 §7.1 for Ed25519 in both directions, and the DRBG
-against vectors computed outside it, and RFC 4231 for HMAC-SHA-256. 58 in
+against vectors computed outside it, and RFC 4231 for HMAC-SHA-256. 60 in
 total.
 
 **Transport**: RFC 4251 §5 for the wire types, RFC 4253 §6 for the packet
