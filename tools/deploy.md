@@ -47,8 +47,9 @@ downloaded once per install, so caching bought nothing and cost exactly that.
 ## What is deployed
 
 - The artifacts are attached to a GitHub release.
-- A Worker named `berryssh` fetches them and re-serves them with the MIME types
-  above, buffering rather than streaming so `Content-Length` is exact.
+- A Worker named `berryssh` (source in `worker/`) fetches them and re-serves
+  them with the MIME types above, buffering rather than streaming so
+  `Content-Length` is exact.
 - It is attached to `berryssh.cobanov.run` as a Workers custom domain.
 
 To publish a new build:
@@ -58,27 +59,43 @@ To publish a new build:
 gh release create vX.Y.Z out/berryssh.jar out/berryssh.jad
 ```
 
-Then point the Worker's `RELEASE` constant at the new tag. The version in the
-descriptor must increase, or the device refuses the update as already
-installed — and says nothing about versions when it does.
-
-## The deploy is not finished when the upload returns
-
-Pointing `RELEASE` at a new tag does not take effect everywhere at once. During
-the 0.8.0 deploy the descriptor came back as 0.8.0 while the jar was still the
-0.7.0 one — a `MIDlet-Jar-Size` of 159327 against a jar of 157764, which is the
-silent install failure above, manufactured by the deploy rather than by a
-mistake in the build. It settled about a minute later.
-
-So check before treating a release as live, and check the two against each
-other rather than separately:
+Then set `RELEASE` in `worker/worker.js` to the new tag and deploy:
 
 ```sh
-curl -s http://berryssh.cobanov.run/berryssh.jad          # note Jar-Size
+(cd worker && wrangler deploy)
+```
+
+The version in the descriptor must increase, or the device refuses the update
+as already installed, and says nothing about versions when it does.
+
+## The descriptor can no longer outrun its jar
+
+During the 0.8.0 deploy the descriptor came back as 0.8.0 while the jar was
+still the 0.7.0 one for about a minute after the Worker upload returned: a
+`MIDlet-Jar-Size` of 159327 against a jar of 157764, the silent install
+failure above, manufactured by the deploy rather than by a mistake in the
+build (#64). Whether that was Worker versions propagating at different times
+or a cache on the jar subrequest was never settled, and the Worker now
+closes both:
+
+- It rewrites the descriptor on the way through. `MIDlet-Jar-Size` is the
+  length of the jar the Worker itself fetched for that version, so the two
+  cannot disagree within one response.
+- `MIDlet-Jar-URL` names the versioned jar, `berryssh-X.Y.Z.jar`, which is
+  served from that version's release whatever `RELEASE` says by the time the
+  second request lands. An install that starts on one version finishes on
+  it. The bare `berryssh.jar` still resolves to `RELEASE` for anything that
+  holds an old descriptor.
+
+Still check before treating a release as live, and check the two against each
+other rather than separately, following the descriptor's own jar URL:
+
+```sh
+curl -s http://berryssh.cobanov.run/berryssh.jad          # note Jar-URL, Jar-Size
 curl -s -o /tmp/dl.jar -w '%{size_download}\n' \
-  http://berryssh.cobanov.run/berryssh.jar                # must equal it
+  http://berryssh.cobanov.run/berryssh-X.Y.Z.jar          # must equal Jar-Size
 shasum -a 256 /tmp/dl.jar out/berryssh.jar                # must be one hash
 ```
 
 The last line is the one that matters: a size can match by coincidence, a
-SHA-256 of the artifact you actually built cannot. See #64.
+SHA-256 of the artifact you actually built cannot.

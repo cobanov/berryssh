@@ -1,0 +1,8 @@
+name = "berryssh"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+workers_dev = false
+
+[[routes]]
+pattern = "berryssh.cobanov.run"
+custom_domain = true
