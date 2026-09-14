@@ -33,7 +33,7 @@ if [ ! -f "$FONT" ]; then
 fi
 
 echo "==> generating atlases"
-for spec in "8 14 mono8x14.png" "6 11 mono6x11.png" "6 9 mono6x9.png"; do
+for spec in "8 14 mono8x14.png" "6 11 mono6x11.png" "6 9 mono6x9.png" "10 18 mono10x18.png" "12 21 mono12x21.png"; do
     set -- $spec
     java tools/MakeAtlas.java "$FONT" "$1" "$2" "ssh/res/fonts/$3"
 done

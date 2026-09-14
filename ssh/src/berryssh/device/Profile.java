@@ -42,9 +42,9 @@ public final class Profile {
     private static final int FORMAT_WITHOUT_KEY = 1;
 
     /** Cell sizes the atlases exist for, and what they give on a 480x360 screen. */
-    public static final int[] CELL_WIDTHS = { 8, 6, 6 };
-    public static final int[] CELL_HEIGHTS = { 14, 11, 9 };
-    public static final String[] SIZE_LABELS = { "8x14 (60 cols)", "6x11 (80 cols)", "6x9 (80 cols)" };
+    public static final int[] CELL_WIDTHS = { 8, 6, 6, 10, 12 };
+    public static final int[] CELL_HEIGHTS = { 14, 11, 9, 18, 21 };
+    public static final String[] SIZE_LABELS = { "8x14 (60 cols)", "6x11 (80 cols)", "6x9 (80 cols)", "10x18 (48 cols)", "12x21 (40 cols)" };
 
     private final String name;
     private final String host;
