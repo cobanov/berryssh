@@ -68,6 +68,13 @@ NAME = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 # one cannot be told from how long it took.
 FAILURE_DELAY = 1.0
 
+# How long a connection has to get from its first byte to an open target. The
+# hostname is public, so anyone can connect and then say nothing; without a
+# limit each of them holds a thread here for as long as they care to. A handset
+# on a slow link needs a few seconds at most. Lifted once the target is open,
+# since an idle shell is not a stalled handshake.
+HANDSHAKE_TIMEOUT = 20.0
+
 
 def read_request(conn):
     data = b""
@@ -116,7 +123,7 @@ def read_frame(conn):
     return opcode, payload
 
 
-def write_frame(conn, opcode, payload):
+def write_frame(conn, opcode, payload, lock=None):
     header = bytes([0x80 | opcode])
     n = len(payload)
     if n < 126:
@@ -125,7 +132,14 @@ def write_frame(conn, opcode, payload):
         header += bytes([126]) + struct.pack(">H", n)
     else:
         header += bytes([127]) + struct.pack(">Q", n)
-    conn.sendall(header + payload)
+    if lock is None:
+        conn.sendall(header + payload)
+    else:
+        # Two threads write once the target is open: one carries the server's
+        # bytes and the other answers pings. A frame is only a frame if nothing
+        # lands in the middle of it.
+        with lock:
+            conn.sendall(header + payload)
 
 
 class Framed:
@@ -199,6 +213,7 @@ def authenticate(stream, psk):
 def serve(conn, targets, psk):
     upstream = None
     try:
+        conn.settimeout(HANDSHAKE_TIMEOUT)
         path, key = read_request(conn)
         if not key:
             conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
@@ -243,14 +258,23 @@ def serve(conn, targets, psk):
             stream.write_line("ERR no such target")
             return
 
-        upstream = socket.create_connection((target[0], target[1]), timeout=15)
+        try:
+            upstream = socket.create_connection((target[0], target[1]), timeout=15)
+        except OSError:
+            # Said, rather than left as a closed connection: on the handset a
+            # machine that is switched off should not look like a broken bridge.
+            stream.write_line("ERR " + name + " is unreachable")
+            return
         upstream.settimeout(None)
+        conn.settimeout(None)
         stream.write_line("READY")
 
         # Anything that arrived in the same frame as OPEN is already SSH.
         pending = stream.take_pending()
         if pending:
             upstream.sendall(pending)
+
+        sending = threading.Lock()
 
         def pump_up():
             try:
@@ -259,7 +283,7 @@ def serve(conn, targets, psk):
                     if opcode == 0x8:          # close
                         break
                     if opcode == 0x9:          # ping
-                        write_frame(conn, 0xA, payload)
+                        write_frame(conn, 0xA, payload, sending)
                         continue
                     if opcode in (0x0, 0x1, 0x2) and payload:
                         upstream.sendall(payload)
@@ -277,7 +301,7 @@ def serve(conn, targets, psk):
             data = upstream.recv(16384)
             if not data:
                 break
-            write_frame(conn, 0x2, data)
+            write_frame(conn, 0x2, data, sending)
     except Exception:
         pass
     finally:

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Compile the client sources under CLDC 1.1 constraints, then run the test
-# vectors on the host JVM.
+# vectors on a desktop JVM.
 #
 # The two halves are the point: compiling at -source 1.3 against the CLDC
-# bootclasspath proves the code will run on the device, while executing on the
-# host proves it is correct — without a single device round-trip.
+# bootclasspath proves the code will run on the device, while executing on a
+# desktop JVM proves it is correct — without a single device round-trip.
+#
+# All of it happens in the JDK 8 container the build uses, so the only things
+# this machine needs are Docker and the jars lib/fetch.sh downloads.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -14,37 +17,36 @@ DOCKER_CONFIG="$(mktemp -d)"; export DOCKER_CONFIG
 printf '{}' > "$DOCKER_CONFIG/config.json"
 trap 'rm -rf "$DOCKER_CONFIG"' EXIT
 
+if [ ! -f ../lib/cldcapi11.jar ]; then
+    echo "no API stubs yet — run lib/fetch.sh first" >&2
+    exit 1
+fi
+
 rm -rf classes
 mkdir -p classes
 
-echo "==> compiling the client under CLDC 1.1 / -source 1.3"
-# javac's exit status is what decides this, not the presence of some class file:
-# a partial failure still leaves the earlier packages on disk, so counting
+# javac's exit status is what decides each step, not the presence of some class
+# file: a partial failure still leaves the earlier packages on disk, so counting
 # classes would let a package that does not build on the device pass unnoticed.
-# The filtering only applies to a successful run, where it is dropping the
-# -source 1.3 obsolescence notices.
-if ! cldc_output=$(docker run --rm \
-    -v "$PWD/..:/client" -w /client/spike2 \
-    eclipse-temurin:8-jdk \
-    javac -source 1.3 -target 1.3 -nowarn \
-          -bootclasspath /client/lib/cldcapi11.jar:/client/lib/midpapi20.jar \
-          -d classes \
-          $(cd .. && find ssh/src -name '*.java' | sed 's|^|/client/|' | tr '\n' ' ') \
-    2>&1); then
-    echo "$cldc_output" >&2
-    echo "the client did not compile under CLDC constraints" >&2
-    exit 1
-fi
-echo "$cldc_output" | grep -v 'obsolete\|deprecat\|warning' || true
+# The tests are compiled without the CLDC restrictions — they are host-only,
+# and use what the device's Java does not have.
+docker run --rm -v "$PWD/..:/client" -w /client/spike2 eclipse-temurin:8-jdk sh -c '
+    set -e
+    echo "==> compiling the client under CLDC 1.1 / -source 1.3"
+    if ! output=$(javac -source 1.3 -target 1.3 -nowarn -encoding UTF-8 \
+            -bootclasspath ../lib/cldcapi11.jar:../lib/midpapi20.jar \
+            -d classes $(find ../ssh/src -name "*.java") 2>&1); then
+        echo "$output" >&2
+        echo "the client did not compile under CLDC constraints" >&2
+        exit 1
+    fi
 
-echo "==> compiling tests (host JDK, sees the CLDC-built classes)"
-javac -nowarn -cp classes -d classes src/*.java
+    echo "==> compiling the tests"
+    javac -nowarn -encoding UTF-8 -cp classes -d classes \
+        src/CryptoTests.java src/TransportTests.java src/TerminalTests.java
 
-echo "==> running crypto vectors on host JVM"
-java -cp classes CryptoTests
-
-echo "==> running transport vectors on host JVM"
-java -cp classes TransportTests
-
-echo "==> running terminal vectors on host JVM"
-java -cp classes TerminalTests
+    for suite in CryptoTests TransportTests TerminalTests; do
+        echo "==> $suite"
+        java -cp classes "$suite"
+    done
+'

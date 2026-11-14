@@ -55,7 +55,8 @@ downloaded once per install, so caching bought nothing and cost exactly that.
 To publish a new build:
 
 ```sh
-./build.sh                                          # bump VERSION first
+# bump Transport.SOFTWARE_VERSION first; build.sh reads the version from it
+./build.sh
 gh release create vX.Y.Z out/berryssh.jar out/berryssh.jad
 ```
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Serve a BBSSH OTA directory to a BlackBerry device over the local network.
+"""Serve a build to a BlackBerry device over the local network.
 
 The BlackBerry browser dispatches an over-the-air install based on the MIME
 type of the descriptor, so a generic static file server will show the .jad as
@@ -9,7 +9,7 @@ needs and nothing else.
 Plain HTTP on purpose: the OS 7 browser's trust store predates every currently
 issued CA, so an HTTPS host will fail to validate.
 
-    python3 tools/ota_server.py archive/binaries/ota-7.1.0
+    ./build.sh && python3 tools/ota_server.py out
 
 Then open the printed URL in the device's native browser (over Wi-Fi).
 """
@@ -22,9 +22,7 @@ import socket
 
 MIME_TYPES = {
     ".jad": "text/vnd.sun.j2me.app-descriptor",
-    ".cod": "application/vnd.rim.cod",   # RIM COD application (BBSSH)
-    ".jar": "application/java-archive",  # plain MIDlet suite
-    ".alx": "application/octet-stream",
+    ".jar": "application/java-archive",
 }
 
 
@@ -38,7 +36,8 @@ class OTARequestHandler(http.server.SimpleHTTPRequestHandler):
         print(f"  {self.address_string()}  {fmt % args}", flush=True)
 
     def end_headers(self):
-        # Some devices refuse a download they cannot size up front.
+        # A descriptor cached beside a newer jar states the wrong size, and the
+        # install then fails without saying why. See tools/deploy.md.
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
@@ -55,7 +54,7 @@ def lan_address():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("directory", type=pathlib.Path, help="directory holding BBSSH.jad and its .cod files")
+    ap.add_argument("directory", type=pathlib.Path, help="directory holding berryssh.jad and berryssh.jar")
     ap.add_argument("--port", type=int, default=8080)
     args = ap.parse_args()
 
@@ -63,8 +62,8 @@ def main():
     if not descriptors:
         raise SystemExit(f"No .jad descriptor in {args.directory}")
 
-    payload = sorted(args.directory.glob("*.cod")) + sorted(args.directory.glob("*.jar"))
-    print(f"Serving {len(descriptors)} descriptor(s) + {len(payload)} module(s) from {args.directory}")
+    jars = sorted(args.directory.glob("*.jar"))
+    print(f"Serving {len(descriptors)} descriptor(s) + {len(jars)} jar(s) from {args.directory}")
     print("\n  On the BlackBerry browser, open:")
     for jad in descriptors:
         print(f"    http://{lan_address()}:{args.port}/{jad.name}")
