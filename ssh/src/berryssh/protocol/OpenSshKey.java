@@ -109,11 +109,4 @@ public final class OpenSshKey {
         return seed;
     }
 
-    /** The `ssh-ed25519 AAAA...` line to put in an authorized_keys file. */
-    public static String authorizedKey(byte[] seed) {
-        WireWriter w = new WireWriter(64);
-        w.writeAsciiString(HostKey.ALGORITHM);
-        w.writeString(Ed25519.publicKey(seed));
-        return HostKey.ALGORITHM + " " + Base64.encode(w.toByteArray());
-    }
 }

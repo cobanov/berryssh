@@ -34,6 +34,11 @@ public final class UserAuth {
         this.user = user;
     }
 
+    /** The connection this authenticates, which is what a channel is opened on. */
+    public Connection connection() {
+        return connection;
+    }
+
     /**
      * Anything the server asked to be shown to the user.
      *
@@ -76,6 +81,28 @@ public final class UserAuth {
         public String[] methodsThatCanContinue() {
             return continueWith;
         }
+
+        /** Whether the server named this method as one that could still succeed. */
+        public boolean offers(String method) {
+            for (int i = 0; i < continueWith.length; i++) {
+                if (continueWith[i].equals(method)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /** The methods as the server listed them, for telling the user. */
+        public String describeMethods() {
+            StringBuffer sb = new StringBuffer();
+            for (int i = 0; i < continueWith.length; i++) {
+                if (i > 0) {
+                    sb.append(", ");
+                }
+                sb.append(continueWith[i]);
+            }
+            return sb.toString();
+        }
     }
 
     /** Starts the authentication service. Must be called before any attempt. */
@@ -93,6 +120,36 @@ public final class UserAuth {
         WireWriter w = request("none");
         connection.transport().writePacket(w.toByteArray());
         return readOutcome();
+    }
+
+    /**
+     * Logs in with whatever there is: nothing at all, then the key, then the
+     * password.
+     *
+     * Nothing comes first because a server may ask for nothing. Tailscale SSH
+     * is one: it has already decided who is calling from the network they came
+     * in on, and answers `none` with success. That answer used to be thrown
+     * away, and the key or password sent after it reached a server that had
+     * stopped listening for either.
+     *
+     * A method is only tried when the server's last answer named it. Sending a
+     * password to a server that takes keys alone cannot work, costs a round
+     * trip, and counts against the attempts it allows.
+     *
+     * @param seed     the Ed25519 private seed, or null for no key
+     * @param password the password, or empty for none
+     * @return the last outcome; when it failed, its methods say what the server
+     *         would have accepted
+     */
+    public Result authenticate(byte[] seed, String password) throws IOException {
+        Result result = queryMethods();
+        if (!result.succeeded() && seed != null && result.offers("publickey")) {
+            result = publicKey(seed);
+        }
+        if (!result.succeeded() && password.length() > 0 && result.offers("password")) {
+            result = password(password);
+        }
+        return result;
     }
 
     public Result password(String password) throws IOException {

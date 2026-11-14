@@ -92,8 +92,4 @@ public final class HostKey {
         return "SHA256:" + Base64.encodeUnpadded(SHA256.hash(blob));
     }
 
-    /** The `ssh-ed25519 AAAA...` form, as it appears in a known_hosts file. */
-    public String toAuthorizedKey() {
-        return ALGORITHM + " " + Base64.encode(blob);
-    }
 }

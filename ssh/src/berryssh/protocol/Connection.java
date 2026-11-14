@@ -64,6 +64,12 @@ public final class Connection implements Transport.RekeyHandler {
         transport.writePacket(ours.payload());
         KexInit theirs = KexInit.parse(expect(transport.readMessage(), Message.KEXINIT));
 
+        // Decided by the first exchange and kept for the connection. The same
+        // names in a later KEXINIT mean nothing, so rekey() does not look.
+        if (theirs.offersStrictKex()) {
+            transport.enableStrictKex();
+        }
+
         Negotiation negotiated = Negotiation.between(ours, theirs);
         if (negotiated.discardGuessedPacket()) {
             // The server guessed the key exchange wrongly. Its next packet is

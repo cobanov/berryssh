@@ -132,6 +132,41 @@ public final class Utf8 {
         return decode(b, 0, b.length);
     }
 
+    /**
+     * How many bytes at the end of the range begin a character whose remaining
+     * bytes have not arrived yet: 0 to 3.
+     *
+     * A stream is read in pieces, and a piece ends wherever the network or the
+     * buffer happened to end it — in the middle of a two-byte s-cedilla or a
+     * three-byte box-drawing line as readily as anywhere else. Decoding each
+     * piece on its own turned both halves into U+FFFD. The caller holds these
+     * bytes back and puts them in front of the next piece instead.
+     *
+     * Only a sequence that is cut short is held. One that is malformed is left
+     * for {@link #decode} to replace, so garbage cannot be held back for ever.
+     */
+    public static int incompleteTail(byte[] b, int offset, int length) {
+        int end = offset + length;
+        // A character is at most four bytes, so the lead byte of an unfinished
+        // one is among the last three.
+        for (int back = 1; back <= 3 && back <= length; back++) {
+            int c = b[end - back] & 0xff;
+            if ((c & 0xc0) == 0x80) {
+                continue;
+            }
+            int needs = 1;
+            if ((c & 0xe0) == 0xc0) {
+                needs = 2;
+            } else if ((c & 0xf0) == 0xe0) {
+                needs = 3;
+            } else if ((c & 0xf8) == 0xf0) {
+                needs = 4;
+            }
+            return needs > back ? back : 0;
+        }
+        return 0;
+    }
+
     private static boolean isHighSurrogate(int c) {
         return c >= 0xd800 && c <= 0xdbff;
     }

@@ -5,6 +5,7 @@ import java.io.IOException;
 import javax.microedition.lcdui.Canvas;
 import javax.microedition.lcdui.Graphics;
 
+import berryssh.crypto.EntropyPool;
 import berryssh.terminal.BitmapFont;
 import berryssh.terminal.VT320;
 
@@ -45,6 +46,7 @@ public final class TerminalCanvas extends Canvas {
     private static final int COLOUR_BACKGROUND = 0xf00;
 
     private final BitmapFont font;
+    private final EntropyPool entropy;
     private VT320 terminal;
     private Keyboard keyboard;
     private String status = "";
@@ -65,8 +67,9 @@ public final class TerminalCanvas extends Canvas {
      * cannot get out of is worse than a slightly shorter one, and there is no
      * other way off this screen, since every command lives in that menu.
      */
-    public TerminalCanvas(BitmapFont font) {
+    public TerminalCanvas(BitmapFont font, EntropyPool entropy) {
         this.font = font;
+        this.entropy = entropy;
         setFullScreenMode(false);
     }
 
@@ -140,15 +143,6 @@ public final class TerminalCanvas extends Canvas {
     }
 
     /**
-     * Shows the raw code of each key pressed instead of the status message.
-     *
-     * This is the measurement issue #11 has been waiting for. MIDP guarantees
-     * nothing about what a BlackBerry sends for its own Escape, Menu, Symbol
-     * and Alt keys, and putting the readout in the app itself means the numbers
-     * can be read off the hardware in the place they matter rather than from a
-     * separate probe.
-     */
-    /**
      * Moves the view back through the scrollback, a screen at a time.
      *
      * Bounded by what the buffer actually holds rather than by a guess: asking
@@ -186,10 +180,14 @@ public final class TerminalCanvas extends Canvas {
         }
     }
 
-    public boolean isScrolledBack() {
-        return scrollOffset > 0;
-    }
-
+    /**
+     * Shows the raw code of each key pressed instead of the status message.
+     *
+     * MIDP guarantees nothing about what a BlackBerry sends for its own Escape,
+     * Menu, Symbol and Alt keys, and putting the readout in the app itself
+     * means the numbers can be read off the hardware in the place they matter
+     * rather than from a separate probe.
+     */
     public void toggleKeyCodes() {
         showKeyCodes = !showKeyCodes;
         repaint();
@@ -240,8 +238,10 @@ public final class TerminalCanvas extends Canvas {
                 // The cursor last, so it sits over whatever is beneath it. Not
                 // drawn when the view is scrolled back: it would then point at
                 // a line that is not the one being edited, which is worse than
-                // showing nothing.
-                if (scrollOffset == 0) {
+                // showing nothing. Nor when the program has hidden it, which a
+                // full-screen one does so that a block does not sit wherever
+                // its last write happened to end.
+                if (scrollOffset == 0 && terminal.showcursor) {
                     int cursorRow = terminal.ROW;
                     int cursorColumn = terminal.COLUMN;
                     if (cursorRow >= 0 && cursorRow < rows
@@ -334,6 +334,11 @@ public final class TerminalCanvas extends Canvas {
     }
 
     private void deliver(int keyCode) {
+        // When a key was pressed is the least predictable thing this device
+        // knows, so every press goes into the pool that the next key exchange
+        // draws from.
+        entropy.addKeystroke(keyCode);
+
         int action = 0;
         try {
             action = getGameAction(keyCode);

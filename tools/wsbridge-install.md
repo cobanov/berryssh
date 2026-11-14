@@ -160,8 +160,8 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 ```
 
 `101` means the bridge answered and is now waiting to be authenticated. It will
-not say anything further, and will close, which is correct: `curl` does not
-have the key.
+not say anything further, and closes the connection after twenty seconds, which
+is correct: `curl` does not have the key.
 
 ## On the handset
 

@@ -425,22 +425,34 @@ public final class Ed25519 {
         sha.update(signature, 0, 32);
         sha.update(publicKey, 0, publicKey.length);
         sha.update(message, 0, message.length);
-        byte[] k = sha.digest();
+        // Reduced mod L, as signing does. The digest is 512 bits and the group
+        // order is 253, so using it whole was 512 doublings where 253 do.
+        byte[] k = ScalarModL.reduce(sha.digest());
 
-        // RFC 8032 5.1.7 interprets the whole 64-octet digest as the scalar, so
-        // it is used unreduced; that costs extra doublings and no correctness.
-        Point ka = scalarMult(a, k, 512);
-
-        // S is the second half of the signature, and scalarMult indexes from
-        // the start of the array it is given.
         byte[] s = new byte[32];
         System.arraycopy(signature, 32, s, 0, 32);
-        Point sb = scalarMult(BASE, s, 253);
 
-        Point negKa = new Point();
-        negate(negKa, ka);
-        Point r = new Point();
-        add(r, sb, negKa);
+        // [S]B - [k]A, with the doublings shared between the two: one ladder
+        // of 253 steps instead of one of 253 and one of 512. This is the
+        // slowest thing a connection does on the handset, so it is worth a
+        // third of the time. Neither scalar is secret — a verifier holds only
+        // public values — so the data-dependent additions leak nothing.
+        Point negA = new Point();
+        negate(negA, a);
+        Point r = identity();
+        Point tmp = new Point();
+        for (int i = 252; i >= 0; i--) {
+            dbl(tmp, r);
+            Point t = r; r = tmp; tmp = t;
+            if (((s[i >>> 3] >>> (i & 7)) & 1) != 0) {
+                add(tmp, r, BASE);
+                t = r; r = tmp; tmp = t;
+            }
+            if (((k[i >>> 3] >>> (i & 7)) & 1) != 0) {
+                add(tmp, r, negA);
+                t = r; r = tmp; tmp = t;
+            }
+        }
 
         byte[] expected = compress(r);
         int diff = 0;

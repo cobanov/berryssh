@@ -188,15 +188,6 @@ public final class Profile {
         return "/fonts/mono" + cellWidth() + "x" + cellHeight() + ".png";
     }
 
-    /** What the connection list shows: enough to tell two servers apart. */
-    public String label() {
-        String where = user + "@" + host;
-        if (port != 22) {
-            where = where + ":" + port;
-        }
-        return name.length() > 0 ? name + "  (" + where + ")" : where;
-    }
-
     /**
      * Serialises for storage.
      *

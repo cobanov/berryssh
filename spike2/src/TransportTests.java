@@ -62,6 +62,8 @@ public class TransportTests {
         packetCipherVectors();
         encryptedFraming();
         utf8Vectors();
+        splitCharacters();
+        strictKeyExchange();
         knownHostsPolicy();
         savedConnections();
         opensshPrivateKeys();
@@ -284,11 +286,11 @@ public class TransportTests {
 
         check("client sends its identification with CR LF",
             client.toByteArray(),
-            toHex(Ascii.toBytes("SSH-2.0-berryssh_0.1\r\n")));
+            toHex(Ascii.toBytes("SSH-2.0-" + Transport.SOFTWARE_VERSION + "\r\n")));
         checkTrue("banner lines are skipped and CR LF is stripped",
             "SSH-2.0-OpenSSH_9.6".equals(t.serverVersion()));
         checkTrue("client version is kept for the exchange hash",
-            "SSH-2.0-berryssh_0.1".equals(t.clientVersion()));
+            ("SSH-2.0-" + Transport.SOFTWARE_VERSION).equals(t.clientVersion()));
 
         try {
             checkTrue("the packet behind the identification string survives",
@@ -338,8 +340,10 @@ public class TransportTests {
         check("KEXINIT payload",
             KexInit.clientWithCookie(cookie).payload(),
             "14000102030405060708090a0b0c0d0e0f"
-                + "0000002e637572766532353531392d7368613235362c"
-                + "637572766532353531392d736861323536406c69627373682e6f7267"
+                + "0000004b637572766532353531392d7368613235362c"
+                + "637572766532353531392d736861323536406c69627373682e6f72672c"
+                // kex-strict-c-v00@openssh.com
+                + "6b65782d7374726963742d632d763030406f70656e7373682e636f6d"
                 + "0000000b7373682d65643235353139"
                 + "0000001d63686163686132302d706f6c7931333035406f70656e7373682e636f6d"
                 + "0000001d63686163686132302d706f6c7931333035406f70656e7373682e636f6d"
@@ -353,9 +357,10 @@ public class TransportTests {
         try {
             KexInit parsed = KexInit.parse(KexInit.clientWithCookie(cookie).payload());
             checkTrue("KEXINIT parses back to the lists it was built from",
-                parsed.kexAlgorithms().length == 2
+                parsed.kexAlgorithms().length == 3
                     && "curve25519-sha256".equals(parsed.kexAlgorithms()[0])
                     && "curve25519-sha256@libssh.org".equals(parsed.kexAlgorithms()[1])
+                    && KexInit.STRICT_CLIENT.equals(parsed.kexAlgorithms()[2])
                     && "ssh-ed25519".equals(parsed.hostKeyAlgorithms()[0])
                     && "chacha20-poly1305@openssh.com".equals(parsed.ciphersServerToClient()[0])
                     && "none".equals(parsed.compressionClientToServer()[0])
@@ -489,9 +494,6 @@ public class TransportTests {
             HostKey key = HostKey.parse(blob);
             checkTrue("host key fingerprint matches ssh-keygen -lf",
                 "SHA256:9tqjakW/Ia6U4hT3VgAv8EXXCxC1d3ez9mr5qjVTRZs".equals(key.fingerprint()));
-            checkTrue("host key renders as a known_hosts line",
-                ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIC/wHCJwWYvv0G8E9MgN8g2gfFoINNE"
-                    + "+MnvBxe79m8u/").equals(key.toAuthorizedKey()));
             checkTrue("host key exposes the 32 raw bytes",
                 key.publicKey().length == 32);
         } catch (IOException e) {
@@ -703,6 +705,145 @@ public class TransportTests {
     }
 
     /**
+     * A stream is read in pieces that end wherever the network ended them, and
+     * every piece is decoded on its own. So the bytes are cut at every possible
+     * place, and the two halves decoded the way the session loop does it —
+     * holding back what {@link Utf8#incompleteTail} says is unfinished.
+     */
+    private static void splitCharacters() {
+        // One-, two-, three- and four-byte characters, next to each other.
+        String text = "aşı─ğ😀z";
+        byte[] bytes = Utf8.encode(text);
+
+        boolean everyCutSurvives = true;
+        for (int cut = 0; cut <= bytes.length; cut++) {
+            int held = Utf8.incompleteTail(bytes, 0, cut);
+            String first = Utf8.decode(bytes, 0, cut - held);
+            String second = Utf8.decode(bytes, cut - held, bytes.length - (cut - held));
+            if (!text.equals(first + second)) {
+                everyCutSurvives = false;
+            }
+        }
+        checkTrue("a character cut in two at any byte is put back together", everyCutSurvives);
+
+        checkTrue("complete text holds nothing back",
+            Utf8.incompleteTail(bytes, 0, bytes.length) == 0
+                && Utf8.incompleteTail(hex("6162"), 0, 2) == 0
+                && Utf8.incompleteTail(new byte[0], 0, 0) == 0);
+        checkTrue("the first byte of a two-byte character is held",
+            Utf8.incompleteTail(hex("61c5"), 0, 2) == 1);
+        checkTrue("three of four bytes are held",
+            Utf8.incompleteTail(hex("f09f98"), 0, 3) == 3);
+        // Held bytes are delivered once the rest arrives. Bytes that can never
+        // be completed must not be held, or they would be held for ever.
+        checkTrue("continuation bytes with no lead are not held",
+            Utf8.incompleteTail(hex("618080"), 0, 3) == 0
+                && Utf8.incompleteTail(hex("80808080"), 0, 4) == 0);
+        checkTrue("an invalid lead byte is not held",
+            Utf8.incompleteTail(hex("61ff"), 0, 2) == 0);
+    }
+
+    /**
+     * OpenSSH's strict key exchange, the countermeasure to Terrapin
+     * (CVE-2023-48795). Whether a real server agrees with this reading of it
+     * is settled in ServerTests, where a wrong sequence number fails the very
+     * first encrypted packet; these pin the rules themselves.
+     */
+    private static void strictKeyExchange() {
+        String[] hostKey = { "ssh-ed25519" };
+        String[] ciphers = { "chacha20-poly1305@openssh.com" };
+        try {
+            checkTrue("a server that lists the marker asks for strict key exchange",
+                serverKexInit(new String[] { "curve25519-sha256", KexInit.STRICT_SERVER },
+                    hostKey, ciphers, false).offersStrictKex());
+            checkTrue("a server that does not list it does not",
+                !serverKexInit(new String[] { "curve25519-sha256" },
+                    hostKey, ciphers, false).offersStrictKex());
+            // The client's own marker coming back means nothing: a server that
+            // echoed it has not said it will follow the rule.
+            checkTrue("the client's marker is not the server's",
+                !serverKexInit(new String[] { "curve25519-sha256", KexInit.STRICT_CLIENT },
+                    hostKey, ciphers, false).offersStrictKex());
+            checkTrue("the markers are never chosen as the key exchange method",
+                "curve25519-sha256".equals(Negotiation.between(clientKexInit(),
+                    serverKexInit(new String[] { KexInit.STRICT_SERVER, KexInit.STRICT_CLIENT,
+                        "curve25519-sha256" }, hostKey, ciphers, false)).kex()));
+        } catch (IOException e) {
+            fail("strict key exchange negotiation threw " + e);
+        }
+
+        byte[] kexInit = { 20 };
+        byte[] ignore = { 2 };
+        byte[] newKeys = { 21 };
+        byte[] key = counting(0, PacketCipher.KEY_LENGTH);
+        try {
+            // KEXINIT, then an IGNORE where only key exchange may be.
+            Transport t = transportOver(concat(packet(kexInit), packet(ignore), packet(newKeys)));
+            t.readMessage();
+            t.enableStrictKex();
+            final Transport strict = t;
+            checkRejected("an IGNORE during a strict first exchange ends the connection",
+                () -> strict.readMessage());
+
+            // The same bytes without the rule: the IGNORE is skipped, as ever.
+            t = transportOver(concat(packet(kexInit), packet(ignore), packet(newKeys)));
+            t.readMessage();
+            checkTrue("without the rule an IGNORE is skipped",
+                t.readMessage()[0] == 21);
+
+            // IGNORE first, then KEXINIT: the injection Terrapin starts with.
+            t = transportOver(concat(packet(ignore), packet(kexInit)));
+            t.readMessage();
+            final Transport late = t;
+            checkRejected("a KEXINIT that was not the first packet is refused",
+                () -> late.enableStrictKex());
+
+            // Both counters go back to zero at NEWKEYS, in both directions.
+            t = transportOver(concat(packet(kexInit), packet(newKeys)));
+            t.readMessage();
+            t.enableStrictKex();
+            t.writePacket(kexInit);
+            t.writePacket(newKeys);
+            t.encryptOutgoing(new PacketCipher(key));
+            t.readMessage();
+            t.decryptIncoming(new PacketCipher(key));
+            checkTrue("strict key exchange restarts both sequence numbers at NEWKEYS",
+                t.sendSequence() == 0 && t.receiveSequence() == 0);
+
+            t = transportOver(concat(packet(kexInit), packet(newKeys)));
+            t.readMessage();
+            t.writePacket(kexInit);
+            t.writePacket(newKeys);
+            t.encryptOutgoing(new PacketCipher(key));
+            t.readMessage();
+            t.decryptIncoming(new PacketCipher(key));
+            checkTrue("without it they carry on counting",
+                t.sendSequence() == 2 && t.receiveSequence() == 2);
+        } catch (IOException e) {
+            fail("strict key exchange threw " + e);
+        }
+    }
+
+    /** One payload as an unencrypted packet on the wire. */
+    private static byte[] packet(byte[] payload) throws IOException {
+        ByteArrayOutputStream sink = new ByteArrayOutputStream();
+        new Transport(new ByteArrayInputStream(new byte[0]), sink).writePacket(payload);
+        return sink.toByteArray();
+    }
+
+    private static byte[] concat(byte[] a, byte[] b) {
+        return concat(a, b, new byte[0]);
+    }
+
+    private static byte[] concat(byte[] a, byte[] b, byte[] c) {
+        byte[] out = new byte[a.length + b.length + c.length];
+        System.arraycopy(a, 0, out, 0, a.length);
+        System.arraycopy(b, 0, out, a.length, b.length);
+        System.arraycopy(c, 0, out, a.length + b.length, c.length);
+        return out;
+    }
+
+    /**
      * The trust decision, away from RMS.
      *
      * This is the half of host authentication the signature check cannot do.
@@ -810,12 +951,6 @@ public class TransportTests {
                     && "çağrı".equals(turkishBack.user())
                     && "parolağı".equals(turkishBack.password()));
 
-            checkTrue("the list label identifies the server",
-                full.label().indexOf("cobanov@example.org:2222") >= 0);
-            checkTrue("the default port is left out of the label",
-                basic("", "example.org", 22, "bb", "", false)
-                    .label().indexOf(":22") < 0);
-
             Profile bridged = new Profile("pve", "ssh.example.org", 80, "root", "",
                 false, "", 0, "/", "correct horse battery staple", "pve");
             Profile bridgedBack = Profile.decode(bridged.encode());
@@ -877,10 +1012,6 @@ public class TransportTests {
             String pem = opensshKey(seed, "none");
             check("an OpenSSH key file yields its seed",
                 OpenSshKey.readEd25519Seed(pem), toHex(seed));
-
-            checkTrue("and the authorized_keys line derived from it is right",
-                OpenSshKey.authorizedKey(seed).indexOf(
-                    "AAAAC3NzaC1lZDI1NTE5AAAAIPxRzY5iGKGjjaR+0AIw8FgIFu0TujMDrF3rkRVIkIAl") > 0);
 
             // Whitespace and line breaks vary with however it was pasted.
             checkTrue("a key that lost its line breaks still reads",

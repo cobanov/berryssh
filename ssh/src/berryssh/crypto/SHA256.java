@@ -65,10 +65,19 @@ public final class SHA256 {
     public byte[] digest() {
         long bitCount = byteCount << 3;
 
-        update(new byte[] { (byte) 0x80 }, 0, 1);
-        byte[] zero = new byte[1];
-        while (bufferLength != 56) {
-            update(zero, 0, 1);
+        // The buffer is never full between calls, so there is room for this.
+        buffer[bufferLength++] = (byte) 0x80;
+        if (bufferLength > 56) {
+            // No room left for the length: this block is padding, and the
+            // length goes in one more.
+            while (bufferLength < BLOCK_LENGTH) {
+                buffer[bufferLength++] = 0;
+            }
+            processBlock(buffer, 0);
+            bufferLength = 0;
+        }
+        while (bufferLength < 56) {
+            buffer[bufferLength++] = 0;
         }
 
         byte[] tail = new byte[8];

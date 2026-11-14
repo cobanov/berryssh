@@ -66,6 +66,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     private final Command newConnection = new Command("New", Command.SCREEN, 2);
     private final Command edit = new Command("Edit", Command.SCREEN, 3);
     private final Command delete = new Command("Delete", Command.SCREEN, 4);
+    private final Command forgetKey = new Command("Forget host key", Command.SCREEN, 5);
     private final Command quit = new Command("Quit", Command.EXIT, 9);
 
     // The editor
@@ -148,16 +149,33 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     private final RecordStoreHostKeys hostKeys = new RecordStoreHostKeys();
     private final RecordStoreProfiles store = new RecordStoreProfiles();
 
-    private SocketConnection socket;
-    private Channel channel;
+    /**
+     * Which session is the live one.
+     *
+     * Every session takes a number when it starts, and Disconnect, Reconnect
+     * and Quit move the number on. A session thread that finds the number is
+     * no longer its own has been abandoned: it reports nothing, touches no
+     * screen, and closes only what it opened itself.
+     *
+     * This used to be one boolean shared by every session. Reconnect cleared
+     * it and set it again before the old thread had noticed, so the old thread
+     * carried on believing it was wanted — it raised its "connection closed"
+     * error over the new session and, in its clean-up, closed the new
+     * session's socket.
+     */
+    private volatile int sessionNumber;
 
     /**
-     * Kept so the session can be closed politely. Volatile because it is set on
-     * the session thread and read on the event thread, when Disconnect or Quit
-     * is chosen.
+     * What the live session has open, kept so the event thread can close it.
+     * All three are set and cleared under {@link #sessionLock}, with the
+     * number checked in the same breath, so an abandoned thread cannot leave
+     * its own here for the next session to trip over.
      */
-    private volatile Connection connection;
-    private volatile boolean running;
+    private final Object sessionLock = new Object();
+    private Link link;
+    private Channel channel;
+    private Connection connection;
+
     private boolean fullScreenOn;
 
     /**
@@ -179,7 +197,15 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         // still choosing a connection.
         new Thread(new Runnable() {
             public void run() {
+                // What earlier runs gathered goes in first and is not counted:
+                // the timing harvest still runs in full. It is there so that a
+                // weak harvest on one day is backed by every day before it.
+                byte[] kept = RecordStoreSeed.load();
+                if (kept != null) {
+                    random.addSample(kept);
+                }
                 random.seed();
+                RecordStoreSeed.save(random.exportSeed());
             }
         }).start();
 
@@ -193,6 +219,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         connections.addCommand(newConnection);
         connections.addCommand(edit);
         connections.addCommand(delete);
+        connections.addCommand(forgetKey);
         connections.addCommand(quit);
         connections.setCommandListener(this);
         refreshConnections();
@@ -204,6 +231,17 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
 
     protected void destroyApp(boolean unconditional) {
         shutdown();
+        keepSeed();
+    }
+
+    /**
+     * Saves the pool for the next run, now that it also holds the timing of
+     * everything typed in this one.
+     */
+    private void keepSeed() {
+        if (random.isSeeded()) {
+            RecordStoreSeed.save(random.exportSeed());
+        }
     }
 
     private void refreshConnections() {
@@ -245,6 +283,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     public void commandAction(Command command, Displayable from) {
         if (command == quit) {
             shutdown();
+            keepSeed();
             notifyDestroyed();
             return;
         }
@@ -272,6 +311,26 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
                             AlertType.ERROR, connections);
                     }
                     refreshConnections();
+                }
+                return;
+            }
+            if (command == forgetKey) {
+                // The way past a changed-key warning, and deliberately a
+                // separate act from connecting: the warning refuses to offer
+                // "accept anyway", so the only way on is to come here and say
+                // the old key is no longer the right one.
+                Profile profile = selected();
+                if (profile != null) {
+                    String identity = profile.hostKeyIdentity();
+                    try {
+                        hostKeys.forget(identity, profile.port());
+                        show("Forgot the key of " + identity + ". The next connection"
+                            + " will show its fingerprint and ask again.",
+                            AlertType.INFO, connections);
+                    } catch (IOException e) {
+                        show("Could not forget it: " + e.getMessage(),
+                            AlertType.ERROR, connections);
+                    }
                 }
                 return;
             }
@@ -359,7 +418,6 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             return;
         }
         if (command == reconnect) {
-            shutdown();
             if (current != null) {
                 start(current);
             }
@@ -487,7 +545,8 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
                     constraints = TextField.ANY | TextField.NON_PREDICTIVE; break;
             case FIELD_BRIDGE_TARGET: value = editBridgeTarget; size = 64;
                     constraints = TextField.ANY | TextField.NON_PREDICTIVE; break;
-            default: value = editKey; size = 2048; constraints = TextField.ANY; break;
+            default: value = editKey; size = 2048;
+                    constraints = TextField.ANY | TextField.NON_PREDICTIVE; break;
         }
 
         entry = new TextBox(FIELDS[index], value, size, constraints);
@@ -563,19 +622,15 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     private String[] fetchTargets(String host, int port, String path, String key)
             throws IOException {
         random.seed();
-        SocketConnection probe = openSocket(host, port);
+        Link probe = new Link(openSocket(host, port));
         try {
-            WebSocket ws = WebSocket.connect(probe.openInputStream(),
-                probe.openOutputStream(), host + ":" + port, path, random);
+            WebSocket ws = WebSocket.connect(probe.in, probe.out,
+                host + ":" + port, path, random);
             return BridgeAuth.authenticate(ws.inputStream(), ws.outputStream(), key);
         } finally {
             // Asked and answered; the session opens its own connection. Leaving
             // this one attached would hold a thread on the bridge for nothing.
-            try {
-                probe.close();
-            } catch (IOException e) {
-                // Closing a probe that already failed is not worth reporting.
-            }
+            probe.close();
         }
     }
 
@@ -676,6 +731,20 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             return;
         }
 
+        // Saving replaces the connection of the same name, which is right when
+        // that connection is the one being edited and a silent loss when it is
+        // another. A name left empty becomes the host, so two logins on one
+        // server collided without anyone having typed the same thing twice.
+        if (!name.equals(editingName)) {
+            for (int i = 0; i < profiles.length; i++) {
+                if (name.equals(profiles[i].name())) {
+                    show("There is already a connection called \"" + name
+                        + "\". Give this one another name.", AlertType.WARNING, editor);
+                    return;
+                }
+            }
+        }
+
         Profile profile = new Profile(name, editHost, parsePort(editPort), editUser,
             editPassword, editSavePassword, editKey, editFontSize, editWsPath,
             editBridgeKey, editBridgeTarget);
@@ -710,6 +779,10 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
     }
 
     private void start(final Profile profile) {
+        // Whatever was live is over. Without this a session left running
+        // behind an error alert would keep its socket, with nothing left that
+        // could close it.
+        shutdown();
         current = profile;
 
         BitmapFont font;
@@ -722,7 +795,13 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             return;
         }
 
-        canvas = new TerminalCanvas(font);
+        // The emulator and keyboard on screen belong to the session before
+        // this one. Until the new session attaches its own, a key pressed here
+        // must not be typed into a channel that has been closed.
+        terminal = null;
+        keyboard = null;
+
+        canvas = new TerminalCanvas(font, random);
         canvas.addCommand(control);
         canvas.addCommand(escape);
         canvas.addCommand(pageUp);
@@ -741,30 +820,46 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         // Networking must not run on the event thread: on this platform the
         // first socket open can block for seconds while the radio comes up, and
         // a blocked event thread is a frozen screen.
-        running = true;
+        final int session;
+        synchronized (sessionLock) {
+            session = ++sessionNumber;
+        }
         new Thread(new Runnable() {
             public void run() {
-                runSession(profile);
+                runSession(profile, session);
             }
         }).start();
     }
 
-    private void runSession(Profile profile) {
+    private boolean isLive(int session) {
+        return session == sessionNumber;
+    }
+
+    private void runSession(Profile profile, int session) {
         String host = profile.host();
         int port = profile.port();
+        Link mine = null;
         try {
             random.seed();
 
-            socket = openSocket(host, port);
-            InputStream in = socket.openInputStream();
-            OutputStream out = socket.openOutputStream();
+            mine = new Link(openSocket(host, port));
+            synchronized (sessionLock) {
+                // Disconnect may have been chosen while the socket was still
+                // opening, when there was nothing yet for it to close.
+                if (!isLive(session)) {
+                    return;
+                }
+                link = mine;
+            }
+            InputStream in = mine.in;
+            OutputStream out = mine.out;
 
             // When a path is set the socket is only carrying HTTP, and what
             // SSH actually runs on is the WebSocket inside it. Connection
             // cannot tell the difference, which is the point of it taking
             // streams rather than a socket.
             if (profile.usesWebSocket()) {
-                canvas.setStatus("upgrading to a WebSocket...");
+                status(session, "upgrading to a WebSocket...");
                 WebSocket ws = WebSocket.connect(in, out, host + ":" + port,
                     profile.webSocketPath(), random);
                 in = ws.inputStream();
@@ -774,15 +869,20 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
                 // all, and to which of its machines. Only then is there a
                 // stream for SSH — which still cannot tell any of this happened.
                 if (profile.authenticatesToBridge()) {
-                    canvas.setStatus("authenticating to the bridge...");
+                    status(session, "authenticating to the bridge...");
                     BridgeAuth.authenticate(in, out, profile.bridgeKey());
-                    canvas.setStatus("opening " + profile.bridgeTarget() + "...");
+                    status(session, "opening " + profile.bridgeTarget() + "...");
                     BridgeAuth.open(in, out, profile.bridgeTarget());
                 }
             }
 
             Connection open = new Connection(in, out, random);
-            connection = open;
+            synchronized (sessionLock) {
+                if (!isLive(session)) {
+                    return;
+                }
+                connection = open;
+            }
             HostKey key = open.handshake();
 
             // Not the host: through a bridge that is the relay, and every
@@ -793,7 +893,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             if (trust == KnownHosts.CHANGED) {
                 // Not a question. See KnownHosts for why there is no way past
                 // this short of forgetting the host deliberately.
-                fail(KnownHosts.mismatchWarning(identity, port, key));
+                fail(session, KnownHosts.mismatchWarning(identity, port, key));
                 return;
             }
             if (trust == KnownHosts.UNKNOWN) {
@@ -803,49 +903,48 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
                 // accepted silently, and its key stored — so every later
                 // connection to the real server would raise a mismatch and the
                 // impostor would be the one that looked legitimate.
-                if (!ask("Unknown host",
+                if (!ask(session, "Unknown host",
                         KnownHosts.firstContactPrompt(identity, port, key))) {
-                    fail("Host key rejected. Nothing was stored.");
+                    fail(session, "Host key rejected. Nothing was stored.");
                     return;
                 }
                 KnownHosts.accept(hostKeys, identity, port, key);
             }
 
+            status(session, "authenticating...");
             UserAuth auth = new UserAuth(open, profile.user());
             auth.begin();
-            auth.queryMethods();
-
-            // The key first when there is one, and the password as a fallback:
-            // a key that the server has not been given is a failed attempt, not
-            // a reason to give up on a connection the user can still make.
-            boolean authenticated = false;
-            if (profile.privateKey().length() > 0) {
-                canvas.setStatus("authenticating with the key...");
-                authenticated = auth.publicKey(
-                    OpenSshKey.readEd25519Seed(profile.privateKey())).succeeded();
-            }
-            if (!authenticated && profile.password().length() > 0) {
-                canvas.setStatus("authenticating with the password...");
-                authenticated = auth.password(profile.password()).succeeded();
-            }
-            if (!authenticated) {
-                fail("Authentication failed.");
+            UserAuth.Result outcome = auth.authenticate(
+                profile.privateKey().length() > 0
+                    ? OpenSshKey.readEd25519Seed(profile.privateKey()) : null,
+                profile.password());
+            if (!outcome.succeeded()) {
+                // What the server would have taken is the useful half of a
+                // refusal: "publickey" alone means no password will ever work.
+                String accepted = outcome.describeMethods();
+                fail(session, "Authentication failed."
+                    + (accepted.length() > 0 ? " The server accepts: " + accepted + "." : ""));
                 return;
             }
 
             // A banner is where a server says the password expires next week,
             // which environment you have landed on, or whatever notice it is
-            // obliged to show before a session opens. It was already being
-            // read and then dropped. Shown after authentication rather than as
-            // it arrives, so it does not interrupt a password prompt, and with
-            // the canvas as what follows so the session continues behind it.
+            // obliged to show before a session opens. Shown after
+            // authentication rather than as it arrives, so it does not
+            // interrupt a password prompt, and with the canvas as what follows
+            // so the session continues behind it.
             String banner = auth.banner();
-            if (banner != null && banner.trim().length() > 0) {
+            if (banner != null && banner.trim().length() > 0 && isLive(session)) {
                 show(banner.trim(), AlertType.INFO, canvas);
             }
 
-            final Channel session = Channel.openSession(open);
-            channel = session;
+            final Channel shell = Channel.openSession(open);
+            synchronized (sessionLock) {
+                if (!isLive(session)) {
+                    return;
+                }
+                channel = shell;
+            }
 
             // The canvas has to be on screen before its size means anything:
             // setCurrent is asynchronous and full-screen mode only applies once
@@ -854,9 +953,9 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             canvas.awaitShown(5000);
             int columns = canvas.columns();
             int rows = canvas.rows();
-            terminal = new VT320(columns, rows) {
+            VT320 screen = new VT320(columns, rows) {
                 public void sendData(byte[] b, int offset, int length) throws IOException {
-                    session.write(b, offset, length);
+                    shell.write(b, offset, length);
                 }
 
                 public void beep() {
@@ -868,34 +967,59 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
             // The constructor sizes the buffer to the screen, so without this
             // there is no scrollback at all and paging up would show the screen
             // that is already there.
-            terminal.setScrollbackBufferSize(SCROLLBACK_LINES);
-            keyboard = new Keyboard(terminal);
-            canvas.attach(terminal, keyboard);
-            canvas.setStatus(profile.user() + "@" + host + "  " + columns + "x" + rows);
+            screen.setScrollbackBufferSize(SCROLLBACK_LINES);
+            synchronized (sessionLock) {
+                if (!isLive(session)) {
+                    return;
+                }
+                terminal = screen;
+                keyboard = new Keyboard(screen);
+                canvas.attach(terminal, keyboard);
+            }
+            status(session, profile.user() + "@" + host + "  " + columns + "x" + rows);
 
-            session.requestPty("xterm", columns, rows);
-            session.requestShell();
+            shell.requestPty("xterm", columns, rows);
+            shell.requestShell();
 
             byte[] buffer = new byte[4096];
-            while (running) {
-                int n = session.read(buffer, 0, buffer.length);
+            // Bytes of a character whose rest has not arrived. See
+            // Utf8.incompleteTail: a read ends wherever the network ended it.
+            int held = 0;
+            while (isLive(session)) {
+                int n = shell.read(buffer, held, buffer.length - held);
                 if (n < 0) {
                     break;
                 }
-                // The painter reads this buffer from the event thread while
-                // this thread writes it. VT320 publishes a mutex for exactly
-                // that, and using it is the difference between a redraw during
-                // a scroll and an index off the end of an array being resized.
-                synchronized (terminal.getTermBufferMutex()) {
-                    terminal.putString(Utf8.decode(buffer, 0, n));
+                int have = held + n;
+                held = Utf8.incompleteTail(buffer, 0, have);
+                // VT320.putString takes the buffer's mutex itself, which is
+                // what keeps the painter on the event thread from reading a
+                // screen that is halfway through a scroll.
+                screen.putString(Utf8.decode(buffer, 0, have - held));
+                System.arraycopy(buffer, have - held, buffer, 0, held);
+                if (isLive(session)) {
+                    canvas.repaint();
                 }
-                canvas.repaint();
             }
-            canvas.setStatus("disconnected");
+            status(session, "disconnected");
         } catch (IOException e) {
-            fail(e.getMessage() == null ? e.toString() : e.getMessage());
+            fail(session, e.getMessage() == null ? e.toString() : e.getMessage());
+        } catch (RuntimeException e) {
+            // A fault in here must not end as a thread that died without a
+            // word and a terminal that simply stopped. Saying what it was is
+            // also the only way it will ever get reported.
+            fail(session, "berryssh failed: " + e);
         } finally {
-            closeQuietly();
+            if (mine != null) {
+                mine.close();
+            }
+            synchronized (sessionLock) {
+                if (isLive(session)) {
+                    link = null;
+                    channel = null;
+                    connection = null;
+                }
+            }
         }
     }
 
@@ -945,13 +1069,20 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         }
     }
 
+    /** A session's own progress, which stops mattering once it is abandoned. */
+    private void status(int session, String message) {
+        if (isLive(session)) {
+            canvas.setStatus(message);
+        }
+    }
+
     /**
      * Puts a question to the user and blocks until it is answered.
      *
      * Called from the session thread, never the event thread — waiting on the
      * event thread would deadlock against the very screen being waited for.
      */
-    private boolean ask(String title, String text) {
+    private boolean ask(int session, String title, String text) {
         Form prompt = new Form(title);
         prompt.append(text);
         prompt.addCommand(acceptKey);
@@ -960,6 +1091,11 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
 
         synchronized (promptLock) {
             promptAnswer = null;
+            // An abandoned session has nobody to ask, and shutdown() has
+            // already sent the only wake-up it was going to.
+            if (!isLive(session)) {
+                return false;
+            }
             display.setCurrent(prompt);
             while (promptAnswer == null) {
                 try {
@@ -977,10 +1113,11 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
      *
      * Disconnecting closes the socket under a reader that is blocked on it, so
      * the read fails by design. Showing that as an error would put a warning in
-     * front of a user who just chose to leave.
+     * front of a user who just chose to leave — or, after Reconnect, on top of
+     * the session that replaced this one.
      */
-    private void fail(final String message) {
-        if (!running) {
+    private void fail(int session, String message) {
+        if (!isLive(session)) {
             return;
         }
         canvas.setStatus("");
@@ -1001,16 +1138,21 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
      * dimensions and the display tears.
      */
     private void resizeTerminal() {
-        if (terminal == null || channel == null) {
+        VT320 screen = terminal;
+        Channel shell;
+        synchronized (sessionLock) {
+            shell = channel;
+        }
+        if (screen == null || shell == null) {
             return;
         }
         int columns = canvas.columns();
         int rows = canvas.rows();
-        synchronized (terminal.getTermBufferMutex()) {
-            terminal.setScreenSize(columns, rows, true);
+        synchronized (screen.getTermBufferMutex()) {
+            screen.setScreenSize(columns, rows, true);
         }
         try {
-            channel.windowChange(columns, rows);
+            shell.windowChange(columns, rows);
         } catch (IOException e) {
             // The session is already in trouble if this fails; the read loop
             // will surface it with a better message than this could.
@@ -1027,19 +1169,46 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         }
     }
 
+    /**
+     * Ends the live session, if there is one.
+     *
+     * Moving the number on is what tells the session thread it has been
+     * abandoned; closing its socket is what gets it out of the read it is
+     * blocked in to find that out.
+     */
     private void shutdown() {
-        running = false;
-        sayGoodbye();
-        closeQuietly();
+        Link closing;
+        Channel leaving;
+        Connection goodbye;
+        synchronized (sessionLock) {
+            sessionNumber++;
+            closing = link;
+            leaving = channel;
+            goodbye = connection;
+            link = null;
+            channel = null;
+            connection = null;
+        }
+        // A session waiting on the host key question is waiting for an answer
+        // that is not coming now. Without this its thread waits for ever.
+        synchronized (promptLock) {
+            promptAnswer = Boolean.FALSE;
+            promptLock.notifyAll();
+        }
+        sayGoodbye(leaving, goodbye);
+        if (closing != null) {
+            closing.close();
+        }
     }
 
     /**
-     * Sends SSH_MSG_DISCONNECT before dropping the socket, RFC 4253 section
-     * 11.1. Without it the server cannot tell a user who chose to leave from a
-     * handset that fell off the network, and logs the second.
+     * Closes the channel and sends SSH_MSG_DISCONNECT before the socket is
+     * dropped, RFC 4253 section 11.1. Without it the server cannot tell a user
+     * who chose to leave from a handset that fell off the network, and logs
+     * the second.
      *
      * On its own thread, with a bounded wait, because this runs on the event
-     * thread and neither half of the write is guaranteed to return. writePacket
+     * thread and neither half of a write is guaranteed to return. writePacket
      * takes the send lock, which a rekey can be holding while blocked on a
      * read, and the write itself goes to a socket that may already be gone.
      * Waiting forever on a courtesy would trade a tidy server log for an
@@ -1049,9 +1218,7 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
      * Object.wait — with a flag, because a thread that finishes before the wait
      * begins would otherwise notify nobody and cost the full timeout.
      */
-    private void sayGoodbye() {
-        final Connection open = connection;
-        connection = null;
+    private void sayGoodbye(final Channel leaving, final Connection open) {
         if (open == null) {
             return;
         }
@@ -1060,6 +1227,9 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         new Thread(new Runnable() {
             public void run() {
                 try {
+                    if (leaving != null) {
+                        leaving.close();
+                    }
                     open.transport().writeDisconnect(
                         Transport.DISCONNECT_BY_APPLICATION, "disconnected by the user");
                 } catch (Exception e) {
@@ -1085,22 +1255,57 @@ public final class BerrysshMIDlet extends MIDlet implements CommandListener {
         }
     }
 
-    private void closeQuietly() {
-        try {
-            if (channel != null) {
-                channel.close();
+    /**
+     * A socket and its two streams, which only close together.
+     *
+     * On this platform closing a connection does not close it while a stream
+     * opened from it is still open — the specification says so in as many
+     * words — and only the socket was being closed. So a blocked reader was
+     * not woken by Disconnect, and every look at a bridge's catalogue left a
+     * connection attached to the bridge.
+     */
+    private static final class Link {
+        final SocketConnection socket;
+        final InputStream in;
+        final OutputStream out;
+
+        Link(SocketConnection socket) throws IOException {
+            this.socket = socket;
+            InputStream opened = null;
+            try {
+                opened = socket.openInputStream();
+                this.in = opened;
+                this.out = socket.openOutputStream();
+            } catch (IOException e) {
+                try {
+                    if (opened != null) {
+                        opened.close();
+                    }
+                    socket.close();
+                } catch (IOException ignored) {
+                    // The first failure is the one worth reporting.
+                }
+                throw e;
             }
-        } catch (IOException e) {
-            // Going anyway.
         }
-        try {
-            if (socket != null) {
+
+        /** Never throws: there is nothing to do about a close that failed. */
+        void close() {
+            try {
+                in.close();
+            } catch (IOException e) {
+                // Going anyway.
+            }
+            try {
+                out.close();
+            } catch (IOException e) {
+                // Going anyway.
+            }
+            try {
                 socket.close();
+            } catch (IOException e) {
+                // Going anyway.
             }
-        } catch (IOException e) {
-            // Going anyway.
         }
-        channel = null;
-        socket = null;
     }
 }

@@ -51,6 +51,13 @@ public final class Poly1305 {
     }
 
     public void update(byte[] input, int offset, int length) {
+        // Whole blocks are taken where they lie. Copying each through the
+        // buffer first was a 16-byte arraycopy per block of every packet.
+        while (bufferLength == 0 && length >= 16) {
+            processBlock(input, offset, false);
+            offset += 16;
+            length -= 16;
+        }
         while (length > 0) {
             int take = 16 - bufferLength;
             if (take > length) {
