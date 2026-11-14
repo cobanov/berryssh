@@ -8,11 +8,11 @@
 // The descriptor is rewritten on the way through so that it can never
 // disagree with the jar (#64): MIDlet-Jar-Size is taken from the jar this
 // Worker would actually serve, and MIDlet-Jar-URL names the versioned jar
-// (berryssh-0.8.1.jar), which is fetched from that version's release
+// (berryssh-0.9.0.jar), which is fetched from that version's release
 // regardless of what RELEASE says by the time the second request arrives.
 // A client that starts an install on one version finishes on it.
 
-const RELEASE = "v0.8.1";
+const RELEASE = "v0.9.0";
 
 const REPO = "https://github.com/cobanov/berryssh/releases/download/";
 const JAD_TYPE = "text/vnd.sun.j2me.app-descriptor";
