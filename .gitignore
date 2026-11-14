@@ -16,3 +16,6 @@ lib/*.jar
 
 # Fetched to generate the font atlases; not redistributed here
 /lib/fonts/
+
+# Wrangler's local cache, written by every deploy
+.wrangler/
