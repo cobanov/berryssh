@@ -11,20 +11,43 @@
  * 675 Mass Ave, Cambridge, MA 02139, USA. --LICENSE NOTICE--
  */
 /*
- * Ported into berryssh from BBSSH. The changes are deliberately the smallest
- * possible: the package declaration, and BBSSH's Logger swapped for the Log in
- * this package. Nothing else — not the formatting, not the tabs, not the
- * spelling of the identifiers — has been touched, so that this file can still
- * be diffed against its origin. Reformatting it would make the next person
- * unable to tell a port from a change.
+ * Ported into berryssh from BBSSH, and since 0.9.0 changed where it was wrong.
  *
- * It has no platform dependencies at all beyond java.io.IOException, which is
- * what made it portable as-is: three abstract methods (sendData, beep, resize)
+ * It came across untouched so that it could be diffed against its origin, and
+ * stayed that way until it was fuzzed. Random escape sequences found nine
+ * separate ways to end the session with an exception, and reading the rest
+ * found behaviour that is simply incorrect for the xterm this client says it
+ * is. So this is no longer a port, and these are the changes:
+ *
+ * - Numeric parameters are capped and their count is bounded. Erase, insert
+ *   and delete clamp to the screen. A restore with nothing saved, a string
+ *   terminator with nothing before it and a tab stop past the last column are
+ *   survived.
+ * - Typed characters are sent as UTF-8 rather than truncated to a byte, and
+ *   Backspace sends DEL.
+ * - VPA and the cursor position report are one-based, insert-character
+ *   defaults to one, DECCOLM is ignored, and VT52 cursor addressing reads row
+ *   then column.
+ * - 256-colour, true-colour and bright SGR colours are reduced to the sixteen
+ *   there are, instead of their arguments being read as attributes.
+ * - OSC and DCS strings are skipped instead of accumulated.
+ * - The scrollback keeps its last row and loses no line when it first fills.
+ * - Removed: per-line dirty flags and cursor bookkeeping nothing read, the
+ *   selection and function-key-mode methods nothing called, and the logging.
+ *
+ * The formatting, the tabs and the spelling of the identifiers are still the
+ * original's, so what a diff against BBSSH shows is those changes and no
+ * others. TerminalTests pins each of them and fuzzes the parser.
+ *
+ * It has no platform dependencies beyond java.io.IOException and this
+ * project's own UTF-8 encoder: three abstract methods (sendData, beep, resize)
  * are the entire interface to whatever is driving it.
  */
 package berryssh.terminal;
 
 import java.io.IOException;
+
+import berryssh.protocol.Utf8;
 
 
 /**
@@ -259,6 +282,9 @@ public abstract class VT320 {
 	 * @see VT320.PM
 	 */
 	protected final static char OSC = 157;
+	/** String terminator, the 8-bit form of ESC followed by a backslash. */
+	private final static char ST = 156;
+	private final static char BACKSLASH = 92;
 	/**
 	 * Privacy message
 	 * 
@@ -344,7 +370,8 @@ public abstract class VT320 {
 	private String KeyHome[], KeyEnd[], PrevScn[], NextScn[], Escape[],
 			BackSpace[];
 	// , NUMPlus[]; // NUMDot[],
-	private String osc, dcs; /* to memorize OSC & DCS control sequence */
+	/** True when the last character of an OSC or DCS string was ESC. */
+	private boolean stringSawEscape;
 
 	/** vt320 state variable (internal) */
 	protected int term_state = TSTATE_DATA;
@@ -356,7 +383,6 @@ public abstract class VT320 {
 	private int writeBufferIndex = 0;
 
 	private byte[] writeBuffer = new byte[256];
-	private byte[] stringConversionBuffer = new byte[256];
 
 	public long[][] terminalData;
 
@@ -379,31 +405,14 @@ public abstract class VT320 {
 	// cursor variable
 	// indicates whether or not to show the cursor
 	public boolean showcursor = true;
-	// visual cursor current xpos
-	public int cursorX;
-	// visual cursor current xpos
-	public int cursorY;
 	/** Scroll up when inserting a line. */
 	public final static boolean SCROLL_UP = false;
 	/** Scroll down when inserting a line. */
 	public final static boolean SCROLL_DOWN = true;
 
-	// Note that our XATTR values are stored in the termData as part of the CHAR
-	// section - char needs 16 bits, leaving
-	// us 16 for extended values.
-
-	/**
-	 * Found only int he first column of a row, this attribute menas that the
-	 * row needs to be redrawn.
-	 */
-
-	/** If found in position 0 of theline, indicates that the line is dirty. */
-	public final static long XATTR_DIRTY = 0x00010000;
-	/** An automatic wrap occurs at this character */
-	public final static long XATTR_WRAP = 0x00020000;
-
-	/** Character is selected */
-	public static final int XATTR_SELECTED = 0x10000000;
+	// A cell is a long: the character in the low 16 bits and the attributes
+	// below in the high 32. The per-line dirty and wrap flags that lived in
+	// between are gone — nothing read them, since the canvas repaints whole.
 
 	/** Make character normal. */
 	public final static int NORMAL = 0x00;
@@ -423,9 +432,6 @@ public abstract class VT320 {
 	private Object termBufferMutex = new Object();
 	public String debugName;
 	public final static int BLINK = 0x1000;
-	public static final byte FK_VT100 = 0;
-	public static final byte FK_LINUX_APP_KEYPAD = 1;
-	public static final byte FK_LINUX = 2;
 
 	// @todo can we replace dual arrays with Character[rows][cols]
 	// (attribute,value)?
@@ -465,7 +471,11 @@ public abstract class VT320 {
 		PrevScn[0] = PrevScn[1] = PrevScn[2] = PrevScn[3] = "\u001b[5~";
 		NextScn[0] = NextScn[1] = NextScn[2] = NextScn[3] = "\u001b[6~";
 		Escape[0] = Escape[1] = Escape[2] = Escape[3] = "\u001b";
-		BackSpace[0] = BackSpace[1] = BackSpace[2] = BackSpace[3] = "\b";
+		// DEL, as xterm sends. A pty's erase character is DEL unless someone
+		// changed it, so the ^H that was sent here worked in a shell, whose
+		// line editor accepts both, and was typed into anything that reads
+		// a line from the tty itself — a sudo password prompt included.
+		BackSpace[0] = BackSpace[1] = BackSpace[2] = BackSpace[3] = "\u007f";
 		FunctionKey = new String[21];
 		FunctionKey[0] = "";
 		/*
@@ -516,18 +526,7 @@ public abstract class VT320 {
 
 	}
 
-	/**
-	 * Create a default vt320 terminal with 80 columns and 24 lines.
-	 */
-	public VT320() {
-		this(80, 24);
-	}
 
-	public VT320(String name) {
-		this();
-		this.debugName = name;
-
-	}
 
 	/**
 	 * Send data to remote host
@@ -540,9 +539,7 @@ public abstract class VT320 {
 	 *            number bytes to write
 	 */
 	protected void write(byte[] b, int offset, int length) {
-		// Log.debug("VT320.write(b, o, l) begin");
 		if (writeBufferIndex + length > writeBuffer.length) {
-			// Log.debug("VT320.write recursing - write length too large");
 			if (writeBufferIndex > 0) {
 				// First write out what we have and then try to add this to the
 				// buffer
@@ -556,27 +553,23 @@ public abstract class VT320 {
 				write(b, offset + writeBuffer.length, length
 						- writeBuffer.length);
 			}
-			// Log.debug("VT320.write recursing - outcall");
 		} else {
-			// Log.debug("VT320.write non-recursive begin");
 			System.arraycopy(b, offset, writeBuffer, writeBufferIndex, length);
-			// Log.debug("VT320.write non-recursive complete");
 			writeBufferIndex += length;
 		}
-		// Log.debug("VT320.write(b, o, l) end");
 	}
 
 	protected void flush() {
-		// Log.debug("VT320.flush invoked - idx = " + writeBufferIndex);
 
 		try {
 			sendData(writeBuffer, 0, writeBufferIndex);
 		} catch (IOException e) {
-			Log.error("VT320.flush: IOException received - "
-					+ e.getMessage());
+			// A key that could not be sent means the connection is gone. The
+			// thread reading from it is about to find that out and say so;
+			// the event thread, which is where keys are pressed, has nowhere
+			// to report it.
 		}
 		writeBufferIndex = 0;
-		// Log.debug("VT320.flush complete.");
 	}
 
 	public abstract void sendData(byte[] b, int offset, int length)
@@ -599,66 +592,21 @@ public abstract class VT320 {
 
 		if (len > 0) {
 			synchronized (termBufferMutex) {
-				setLineDirty(ROW - 1);
 				for (int i = 0; i < len; i++) {
-					putChar(s.charAt(i), false);
+					putChar(s.charAt(i));
 				}
 				// Move to end of page for cursor.
-				setCursorPosition(COLUMN, ROW);
 			}
 		}
-	}
-
-	public void putStringStartLine(String s) {
-		int len = s.length();
-
-		if (len > 0) {
-			synchronized (termBufferMutex) {
-				setCursorPosition(0, ROW);
-				setLineDirty(ROW - 1, 1);
-				for (int i = 0; i < len; i++) {
-					putChar(s.charAt(i), false);
-				}
-				setCursorPosition(0, ROW);
-			}
-		}
-
 	}
 
 	/** we should do localecho (passed from other modules). false is default */
 	public boolean localecho = false;
 	public long handledCharCount = 0;
 
-	/**
-	 * Enable or disable the local echo property of the terminal.
-	 * 
-	 * @param echo
-	 *            true if the terminal should echo locally
-	 */
-	public void setLocalEcho(boolean echo) {
-		localecho = echo;
-	}
-
-	/**
-	 * Set the terminal id used to identify this terminal.
-	 * 
-	 * @param terminalID
-	 *            the id string
-	 */
-	public void setTerminalID(String terminalID) {
-		this.terminalID = terminalID;
-	}
-
 	// // public void setAnswerBack( String ab ) {
 	// // this.answerBack = unEscape( ab );
 	// // }
-	/**
-	 * Get the terminal id used to identify this terminal.
-	 */
-	public String getTerminalID() {
-		return terminalID;
-	}
-
 	/**
 	 * A small conveniance method that converts the string to a byte array for
 	 * sending.
@@ -667,10 +615,8 @@ public abstract class VT320 {
 	 *            the string to be sent
 	 */
 	private boolean write(String s, boolean doecho) {
-		// Log.debug("VT320.write(s,b) begin");
 		if (s == null) // aka the empty string.
 		{
-			// Log.debug("VT320.write(s,b) end empty string");
 			return true;
 		}
 
@@ -683,20 +629,15 @@ public abstract class VT320 {
 		 */
 
 		// Maybe extend writeBuffer
-		if (stringConversionBuffer.length < s.length()) {
-			stringConversionBuffer = new byte[s.length()];
-		}
-
-		// Fill writeBuffer
-		for (int i = 0; i < s.length(); i++) {
-			stringConversionBuffer[i] = (byte) s.charAt(i);
-		}
-		write(stringConversionBuffer, 0, s.length());
+		// UTF-8, not a cast to byte. The cast sent the low eight bits of each
+		// character, so a typed s-cedilla (U+015F) arrived as an underscore
+		// and a g-breve (U+011F) as the control character 0x1F.
+		byte[] encoded = Utf8.encode(s);
+		write(encoded, 0, encoded.length);
 
 		if (doecho) {
 			putString(s);
 		}
-		// Log.debug("VT320.write(s,b) end");
 
 		return true;
 	}
@@ -744,20 +685,6 @@ public abstract class VT320 {
 	public void keyTyped(int keyCode, char keyChar, int modifiers) {
 		_keyTyped(keyCode, keyChar, modifiers);
 		flush();
-	}
-
-	// Provides appropriate handling for special keys if shift/alt/ctrl is
-	// in use, but otherwise sends normally (?)
-	// @todo look into terminal spec to see what really has to happen here and
-	// why.
-	public void dispatchKey(int keyCode, char keyChar, int modifiers) {
-		if ((keyCode >= VK_PAGE_UP && keyCode <= VK_DOWN)
-				|| keyCode == VK_BACK_SPACE || keyCode == VK_INSERT
-				|| (keyCode >= VK_F1 && keyCode <= VK_F12)) {
-			keyPressed(keyCode, modifiers);
-		} else {
-			keyTyped(keyCode, keyChar, modifiers);
-		}
 	}
 
 	/**
@@ -839,20 +766,11 @@ public abstract class VT320 {
 		flush();
 	}
 
-	public void stringTyped(String str) {
-		// Log.debug("VT320.stringTyped  " + str);
-		for (int i = 0; i < str.length(); i++) {
-			_keyTyped(0, str.charAt(i), 0);
-		}
-		flush();
-	}
-
 	// @todo we need to present a common interface for sending character --
 	// there's no clear distinction for the end user about when we should send
 	// keyTyped vs keyPressed.
 
 	private void _keyTyped(int keyCode, char keyChar, int modifiers) {
-		// Log.debug("VT320._keyTyped: " + (int) keyChar); @todo DebugVT320
 		boolean control = (modifiers & KEY_CONTROL) != 0;
 		boolean shift = (modifiers & KEY_SHIFT) != 0;
 		boolean alt = (modifiers & KEY_ALT) != 0;
@@ -962,6 +880,94 @@ public abstract class VT320 {
 		}
 	}
 
+	/**
+	 * One more digit of a numeric parameter.
+	 *
+	 * Capped, because the value is the server's to choose: nothing on a screen
+	 * is counted in more than four digits, and an unbounded one overflows into
+	 * a negative number that is then used as an array size.
+	 */
+	private void addParameterDigit(char c) {
+		if (DCEvars[DCEvar] < 10000) {
+			DCEvars[DCEvar] = DCEvars[DCEvar] * 10 + (c - '0');
+		}
+	}
+
+	/** Parameters past the last slot share it rather than run off the array. */
+	private void nextParameter() {
+		if (DCEvar < DCEvars.length - 1) {
+			DCEvar++;
+		}
+		DCEvars[DCEvar] = 0;
+	}
+
+	/**
+	 * Sets one of the eight colours, or for 8 to 15 its bright form.
+	 *
+	 * Bright is carried as bold, which is how the canvas draws it. A background
+	 * has no bright form here and takes the plain colour.
+	 */
+	private void setColour(boolean foreground, int colour) {
+		if (foreground) {
+			attributes &= ~COLOR_FG;
+			attributes |= ((colour & 7) + 1) << 4;
+			if (colour > 7) {
+				attributes |= BOLD;
+			}
+		} else {
+			attributes &= ~COLOR_BG;
+			attributes |= ((colour & 7) + 1) << 8;
+		}
+	}
+
+	/** The xterm 256-colour palette, reduced to the sixteen there are here. */
+	private static int nearestOf256(int n) {
+		if (n < 16) {
+			return n < 0 ? 0 : n;
+		}
+		if (n < 232) {
+			n -= 16;
+			return nearestOfCube(n / 36, (n / 6) % 6, n % 6);
+		}
+		// The grey ramp: dark greys become bright black, which is drawn grey,
+		// rather than black, which on this background is invisible.
+		return n < 244 ? 8 : (n < 250 ? 7 : 15);
+	}
+
+	/** A colour of the 6x6x6 cube, each level 0 to 5. */
+	private static int nearestOfCube(int r, int g, int b) {
+		int colour = (r >= 2 ? 1 : 0) | (g >= 2 ? 2 : 0) | (b >= 2 ? 4 : 0);
+		if (colour == 0) {
+			return (r | g | b) == 0 ? 0 : 8;
+		}
+		return (r == 5 || g == 5 || b == 5) ? colour + 8 : colour;
+	}
+
+	/** An 8-bit colour component as a level of the cube. */
+	private static int cubeLevel(int component) {
+		if (component < 48) {
+			return 0;
+		}
+		if (component < 115) {
+			return 1;
+		}
+		return component > 255 ? 5 : (component - 35) / 40;
+	}
+
+	/** A repeat count: an omitted one means once, and none exceeds the screen. */
+	private static int count(int parameter, int limit) {
+		if (parameter < 1) {
+			return 1;
+		}
+		return parameter > limit ? limit : parameter;
+	}
+
+	private void setTab(int column, int value) {
+		if (column >= 0 && column < Tabs.length) {
+			Tabs[column] = (byte) value;
+		}
+	}
+
 	private void _SetCursor(int row, int col) {
 		int maxr = height;
 		int tm = getTopMargin();
@@ -980,15 +986,13 @@ public abstract class VT320 {
 
 	// StringBuffer buf = new StringBuffer(1024);
 
-	public void putChar(char c, boolean doshowcursor) {
+	private void putChar(char c) {
 		handledCharCount++;
 		int rows = height;
 		int columns = width;
 		int tm = getTopMargin();
 		int bm = getBottomMargin();
-		setLineDirty(ROW, 1);
 		// if (buf.length() >= 1000) {
-		// Log.error(buf.toString());
 		// buf = new StringBuffer(1024);
 		// } else {
 		// buf.append('<').append(c).append(" / ").append((int) c).append(">");
@@ -1062,7 +1066,8 @@ public abstract class VT320 {
 			case HT: // tabs are movement, non-destructive...
 				do {
 					COLUMN++;
-				} while (COLUMN < columns && (Tabs[COLUMN] == 0));
+				} while (COLUMN < columns && COLUMN < Tabs.length
+						&& (Tabs[COLUMN] == 0));
 				// lastwaslf = 0;
 				break;
 			case LF:
@@ -1124,7 +1129,7 @@ public abstract class VT320 {
 				// sequence
 				// interrupting?
 				case OSC:
-					osc = "";
+					stringSawEscape = false;
 					setTermState(TSTATE_OSC);
 					break;
 				case RI:
@@ -1150,10 +1155,10 @@ public abstract class VT320 {
 					COLUMN = 0;
 					break;
 				case HTS:
-					Tabs[COLUMN] = 1;
+					setTab(COLUMN, 1);
 					break;
 				case DCS:
-					dcs = "";
+					stringSawEscape = false;
 					setTermState(TSTATE_DCS);
 					break;
 				default:
@@ -1181,9 +1186,6 @@ public abstract class VT320 {
 					if (wraparound) {
 
 						// Mark the current line as wrapped
-						if (ROW > -1 && ROW < height - 1) {
-							terminalData[ROW][columns - 1] |= XATTR_WRAP;
-						}
 
 						if (ROW < rows - 1) {
 							ROW++;
@@ -1209,20 +1211,18 @@ public abstract class VT320 {
 				break; // TSTATE_DATA
 
 			case TSTATE_OSC:
-				// @todo OSC is where we'll look to implement window title
-				// changes
-				if ((c < 0x20) && (c != ESC)) {// NP - No printing
-					// character handle_osc( osc );
+			case TSTATE_DCS:
+				// Neither string is acted on, so neither is kept: all that
+				// matters is where it ends. They used to be accumulated a
+				// character at a time into a String that nothing read, which
+				// is quadratic and unbounded for whatever a server sends.
+				if (c == CAN || c == SUB || c == ST
+						|| (c == BACKSLASH && stringSawEscape)
+						|| (term_state == TSTATE_OSC && c < 0x20 && c != ESC)) {
 					setTermState(TSTATE_DATA);
 					break;
 				}
-				// but check for vt102 ESC \
-				if (c == '\\' && osc.charAt(osc.length() - 1) == ESC) {
-					// handle_osc( osc );
-					setTermState(TSTATE_DATA);
-					break;
-				}
-				osc = osc + c;
+				stringSawEscape = (c == ESC);
 				break;
 			case TSTATE_ESCSPACE:
 				setTermState(TSTATE_DATA);
@@ -1259,11 +1259,11 @@ public abstract class VT320 {
 					setTermState(TSTATE_CSI);
 					break;
 				case ']':
-					osc = "";
+					stringSawEscape = false;
 					setTermState(TSTATE_OSC);
 					break;
 				case 'P':
-					dcs = "";
+					stringSawEscape = false;
 					setTermState(TSTATE_DCS);
 					break;
 				case 'A': /* CUU */
@@ -1333,7 +1333,7 @@ public abstract class VT320 {
 					if (COLUMN >= columns) {
 						COLUMN = columns - 1;
 					}
-					Tabs[COLUMN] = 1;
+					setTab(COLUMN, 1);
 					break;
 				case 'N': // SS2
 					onegl = 2;
@@ -1365,6 +1365,12 @@ public abstract class VT320 {
 					Sbm = getBottomMargin();
 					break;
 				case '8': /* restore cursor, attributes, margins */
+					if (Sgx == null) {
+						// Nothing was saved. Restoring the zeroes the fields
+						// start with would set the scrolling region to one row.
+						COLUMN = ROW = 0;
+						break;
+					}
 					COLUMN = Sc;
 					ROW = Sr;
 					gl = Sgl;
@@ -1416,16 +1422,15 @@ public abstract class VT320 {
 					setTermState(TSTATE_VT52Y);
 					break;
 				default:
-					Log.debug("Unknown ESC: " + c + " / " + (int) c);
 					break;
 				}
 				break;
-			case TSTATE_VT52X:
-				COLUMN = c - 37;
-				setTermState(TSTATE_VT52Y);
-				break;
 			case TSTATE_VT52Y:
-				ROW = c - 37;
+				ROW = checkBounds(c - 32, 0, rows - 1);
+				setTermState(TSTATE_VT52X);
+				break;
+			case TSTATE_VT52X:
+				COLUMN = checkBounds(c - 32, 0, columns - 1);
 				setTermState(TSTATE_DATA);
 				break;
 			case TSTATE_SETG0:
@@ -1466,14 +1471,6 @@ public abstract class VT320 {
 				}
 				setTermState(TSTATE_DATA);
 				break;
-			case TSTATE_DCS:
-				if (c == '\\' && dcs.charAt(dcs.length() - 1) == ESC) {
-					// handle_dcs( dcs );
-					setTermState(TSTATE_DATA);
-					break;
-				}
-				dcs = dcs + c;
-				break;
 
 			case TSTATE_DCEQ:
 				setTermState(TSTATE_DATA);
@@ -1488,12 +1485,11 @@ public abstract class VT320 {
 				case '7':
 				case '8':
 				case '9':
-					DCEvars[DCEvar] = DCEvars[DCEvar] * 10 + ((int) c) - 48;
+					addParameterDigit(c);
 					setTermState(TSTATE_DCEQ);
 					break;
 				case ';':
-					DCEvar++;
-					DCEvars[DCEvar] = 0;
+					nextParameter();
 					setTermState(TSTATE_DCEQ);
 					break;
 				case 's': // XTERM_SAVE missing!
@@ -1502,9 +1498,7 @@ public abstract class VT320 {
 					/* DEC Mode restore - I believe we should be toggling here? */
 					for (int i = 0; i <= DCEvar; i++) {
 						switch (DCEvars[i]) {
-						case 3: /* 80 columns */
-							setScreenSize(80, height, false);
-							break;
+						
 						case 4: /* scrolling mode, smooth */
 							break;
 						case 5: /* light background */
@@ -1543,9 +1537,7 @@ public abstract class VT320 {
 						case 2: /* DECANM */
 							vt52mode = false;
 							break;
-						case 3: /* 132 columns */
-							setScreenSize(132, height, false);
-							break;
+						
 						case 6: /* DECOM: move inside margins. */
 							moveoutsidemargins = false;
 							break;
@@ -1610,9 +1602,7 @@ public abstract class VT320 {
 						case 2: /* DECANM */
 							vt52mode = true;
 							break;
-						case 3: /* 80 columns */
-							setScreenSize(80, height, false);
-							break;
+						
 						case 6: /* DECOM: move outside margins. */
 							moveoutsidemargins = true;
 							break;
@@ -1663,8 +1653,6 @@ public abstract class VT320 {
 					}
 					break;
 				default:
-					Log.debug("Unknown TSTATE_DCEQ value: " + c + " / "
-							+ (int) c);
 
 					break;
 				}
@@ -1694,8 +1682,6 @@ public abstract class VT320 {
 					}
 					break;
 				default:
-					Log.debug("Unknown TSTATE_CSI_TICKS: " + c + " / "
-							+ (int) c);
 
 					break;
 				}
@@ -1709,8 +1695,6 @@ public abstract class VT320 {
 				case '~':
 					break;
 				default:
-					Log.debug("Unknown TSTATE_CSI_DOLLAR: " + c + " / "
-							+ (int) c);
 					break;
 				}
 				break;
@@ -1741,14 +1725,13 @@ public abstract class VT320 {
 				case '7':
 				case '8':
 				case '9':
-					DCEvars[DCEvar] = DCEvars[DCEvar] * 10 + ((int) c) - 48;
+					addParameterDigit(c);
 					// buf.append("\r\nvar[" + DCEvar + "] = " +
 					// DCEvars[DCEvar]);
 					setTermState(TSTATE_CSI);
 					break;
 				case ';':
-					DCEvar++;
-					DCEvars[DCEvar] = 0;
+					nextParameter();
 					setTermState(TSTATE_CSI);
 					break;
 				// @note This can never be reached here - CSI + c is not a valid
@@ -1768,10 +1751,10 @@ public abstract class VT320 {
 					/* used for tabsets */
 					switch (DCEvars[0]) {
 					case 3:/* clear them */
-						Tabs = new byte[width];
+						Tabs = new byte[Tabs.length];
 						break;
 					case 0:
-						Tabs[COLUMN] = 0;
+						setTab(COLUMN, 0);
 						break;
 					}
 					break;
@@ -1875,7 +1858,7 @@ public abstract class VT320 {
 					}
 					break;
 				case 'd': // CVA
-					ROW = DCEvars[0];
+					ROW = DCEvars[0] - 1;
 					break;
 				case 'D':
 					if (DCEvars[0] == 0) {
@@ -1958,7 +1941,7 @@ public abstract class VT320 {
 					if (DCEvars[0] == 0) {
 						deleteLine(ROW);
 					} else {
-						for (int i = 0; i < DCEvars[0]; i++) {
+						for (int i = 0; i < count(DCEvars[0], rows); i++) {
 							deleteLine(ROW);
 						}
 					}
@@ -2015,7 +1998,7 @@ public abstract class VT320 {
 					}
 					break;
 				case '@':
-					for (int i = 0; i < DCEvars[0]; i++) {
+					for (int i = 0; i < count(DCEvars[0], columns); i++) {
 						insertChar(COLUMN, ROW, ' ', attributes);
 					}
 					break;
@@ -2032,10 +2015,7 @@ public abstract class VT320 {
 					break;
 				}
 				case 'P':
-					if (DCEvars[0] == 0) {
-						DCEvars[0] = 1;
-					}
-					for (int i = 0; i < DCEvars[0]; i++) {
+					for (int i = 0; i < count(DCEvars[0], columns); i++) {
 						deleteChar(COLUMN, ROW);
 					}
 					break;
@@ -2046,8 +2026,8 @@ public abstract class VT320 {
 						flush();
 						break;
 					case 6:
-						writeSpecial(((char) ESC) + "[" + ROW + ";" + COLUMN
-								+ "R");
+						writeSpecial(((char) ESC) + "[" + (ROW + 1) + ";"
+								+ (checkBounds(COLUMN, 0, columns - 1) + 1) + "R");
 						flush();
 						break;
 					default:
@@ -2178,6 +2158,51 @@ public abstract class VT320 {
 						case 49:
 							attributes &= ~COLOR_BG;
 							break;
+						case 90:
+						case 91:
+						case 92:
+						case 93:
+						case 94:
+						case 95:
+						case 96:
+						case 97:
+							setColour(true, DCEvars[i] - 90 + 8);
+							break;
+						case 100:
+						case 101:
+						case 102:
+						case 103:
+						case 104:
+						case 105:
+						case 106:
+						case 107:
+							setColour(false, DCEvars[i] - 100);
+							break;
+						case 38:
+						case 48: {
+							// Extended colour: "38;5;n" or "38;2;r;g;b". There
+							// are eight colours and their bright forms here, so
+							// it is reduced to the nearest of those. What must
+							// not happen is its parameters being read as
+							// attributes of their own: "38;5;1" used to turn
+							// blink and bold on and set no colour at all.
+							boolean foreground = DCEvars[i] == 38;
+							if (i + 2 <= DCEvar && DCEvars[i + 1] == 5) {
+								setColour(foreground, nearestOf256(DCEvars[i + 2]));
+								i += 2;
+							} else if (i + 4 <= DCEvar && DCEvars[i + 1] == 2) {
+								setColour(foreground, nearestOfCube(
+										cubeLevel(DCEvars[i + 2]),
+										cubeLevel(DCEvars[i + 3]),
+										cubeLevel(DCEvars[i + 4])));
+								i += 4;
+							} else {
+								// Malformed. The rest cannot be told apart
+								// from its arguments, so none of it is read.
+								i = DCEvar;
+							}
+							break;
+						}
 
 						default:
 							break;
@@ -2185,7 +2210,6 @@ public abstract class VT320 {
 					}
 					break;
 				default:
-					Log.debug("Unknown CSI: " + c + " / " + (int) c);
 					break;
 				}
 				break;
@@ -2197,8 +2221,8 @@ public abstract class VT320 {
 		if (COLUMN > columns) {
 			COLUMN = columns;
 		}
-		if (ROW > rows) {
-			ROW = rows;
+		if (ROW > rows - 1) {
+			ROW = rows - 1;
 		}
 		if (COLUMN < 0) {
 			COLUMN = 0;
@@ -2206,11 +2230,7 @@ public abstract class VT320 {
 		if (ROW < 0) {
 			ROW = 0;
 		}
-		if (doshowcursor) {
-			setCursorPosition(COLUMN, ROW);
-		}
 
-		setLineDirty(ROW, 1);
 	}
 
 	private String daReply;
@@ -2221,8 +2241,6 @@ public abstract class VT320 {
 		// so if we re ceived a value preceding c that wasn't 0,
 		// it's not right.
 		if (DCEvars[0] != 0) {
-			Log.warn("Received sequence ESC[?nc incorrectly, where n should be 0 and was "
-					+ DCEvars[0]);
 			return;
 		}
 
@@ -2339,7 +2357,6 @@ public abstract class VT320 {
 		c = checkBounds(c, 0, width - 1);
 		l = checkBounds(l, 0, height - 1);
 		terminalData[screenBase + l][c] = (attributes << 32) | ch;
-		setLineDirty(screenBase + l);
 	}
 
 	/**
@@ -2355,22 +2372,6 @@ public abstract class VT320 {
 		c = checkBounds(c, 0, width - 1);
 		l = checkBounds(l, 0, height - 1);
 		return (char) (terminalData[screenBase + l][c]);
-	}
-
-	/**
-	 * Get the attributes for the specified position.
-	 * 
-	 * @param c
-	 *            x-coordinate (column)
-	 * @param l
-	 *            y-coordinate of viewport/window (line)
-	 * @return character attributes for specified location
-	 * @see #putChar
-	 */
-	public int getAttributes(int c, int l) {
-		c = checkBounds(c, 0, width - 1);
-		l = checkBounds(l, 0, height - 1);
-		return (int) ((terminalData[screenBase + l][c] >> 32));
 	}
 
 	/**
@@ -2412,7 +2413,6 @@ public abstract class VT320 {
 	 * @see #insertChar
 	 */
 	private void deleteChar(int c, int l) {
-		// Log.debug("emu.deleteChar: " + l);
 
 		c = checkBounds(c, 0, width - 1);
 		l = checkBounds(l, 0, height - 1);
@@ -2481,9 +2481,11 @@ public abstract class VT320 {
 	 * @see #SCROLL_DOWN
 	 */
 	private void insertLine(int line, int n, boolean scrollDown) {
-		// Log.debug("emu.insertLine: " + line + " / " + n + " / " +
 		// scrollDown);
 
+		if (n < 1) {
+			return;
+		}
 		line = checkBounds(line, 0, height - 1);
 
 		long cbuf[][] = null;
@@ -2506,8 +2508,12 @@ public abstract class VT320 {
 		// bottom +
 		// "bottomargin is " + bottomMargin + ", topMargin is " + topMargin);
 		if (scrollDown) {
-			if (n > (bottom - top)) {
-				n = (bottom - top);
+			// Inserting more lines than there are below the cursor clears
+			// them all. Clamped against the cursor's line rather than the top
+			// of the region: the copy below is sized from it, and went
+			// negative for a count that reached past the bottom margin.
+			if (n > bottom - line + 1) {
+				n = bottom - line + 1;
 			}
 			cbuf = new long[bottom - line - (n - 1)][width];
 			// WTF - why are we reallocating for a simple insert?
@@ -2531,7 +2537,7 @@ public abstract class VT320 {
 					if (bufSize + n > maxBufSize) {
 						offset = n - (maxBufSize - bufSize);
 						bufSize = maxBufSize;
-						screenBase = maxBufSize - height - 1;
+						screenBase = maxBufSize - height;
 						windowBase = screenBase;
 					} else {
 						screenBase += n;
@@ -2582,7 +2588,8 @@ public abstract class VT320 {
 							screenBase + line + 1, (height - 1) - line);
 				}
 			} catch (ArrayIndexOutOfBoundsException e) {
-				Log.error(e + " : " + e.getMessage());
+				// Deliberately survived. This is the one place where a fault
+				// costs a scroll rather than the session.
 				// (comment from Meissner, apparently)
 				// this should not happen anymore, but I will leave the code
 				// here in case something happens anyway. That code above is
@@ -2601,9 +2608,7 @@ public abstract class VT320 {
 		terminalData = cbuf;
 
 		if (scrollDown) {
-			setLineDirty(line, bottom - line + 1);
 		} else {
-			setLineDirty(top, line - top + 1);
 		}
 	}
 
@@ -2617,7 +2622,6 @@ public abstract class VT320 {
 	 * @see #deleteLine
 	 */
 	private void deleteLine(int l) {
-		// Log.debug("emu.deleteLine: " + l);
 		l = checkBounds(l, 0, height - 1);
 
 		int bottom = (l > bottomMargin ? height - 1
@@ -2625,40 +2629,6 @@ public abstract class VT320 {
 		System.arraycopy(terminalData, screenBase + l + 1, terminalData,
 				screenBase + l, bottom - l - 1);
 		terminalData[screenBase + bottom - 1] = new long[width];
-		setLineDirty(l, bottom - l);
-	}
-
-	/**
-	 * Clear the specified attribute for the given line and column. Line and
-	 * column are assumed to be valid
-	 * 
-	 * @param line
-	 *            a valid line at buffer (not viewport) level.
-	 * @param col
-	 *            a valid column.
-	 * @param attribute
-	 *            attribute to clear.
-	 */
-	private void clearAttribute(int line, int col, int attribute) {
-		terminalData[line][col] &= (((~attribute) << 32) | 0xFFFFFFFF);
-	}
-
-	/**
-	 * Clear the specified attribute for the given line and column. Line and
-	 * column are assumed to be valid
-	 * 
-	 * @param line
-	 *            a valid line at the buffer (not viewport) level.
-	 * @param col
-	 *            a valid column.
-	 * @param attribute
-	 *            attribute to set.
-	 * @see #BOLD
-	 * @see #INVERT
-	 * @see #UNDERLINE
-	 */
-	private void setAttribute(int line, int col, int attribute) {
-		terminalData[line][col] |= (attribute << 32);
 	}
 
 	/*
@@ -2668,130 +2638,6 @@ public abstract class VT320 {
 	 * private void clearXAttr(int line, int col, int attribute) {
 	 * terminalData[line][col] &= ~attribute; }
 	 */
-	/**
-	 * Toggle the state of the specifeid attribute at the specified position.
-	 * This requires valid inputs, as it performs no validation itself.
-	 * 
-	 * @param line
-	 * @param col
-	 * @param attribute
-	 */
-	private void toggleAttribute(int line, int col, int attribute) {
-		if ((terminalData[screenBase + line][col] & (attribute << 32)) > 0) {
-			clearAttribute(line, col, attribute);
-
-		} else {
-			setAttribute(line, col, attribute);
-		}
-	}
-
-	/**
-	 * Sets the provided attribute across multiple lines, in a wrapping fashion.
-	 * That is, every character between startline,startcol and endline,endcol
-	 * will be marked as selected/deselected. Lines that fall in between
-	 * startline and endline will be selected /deselected in full.
-	 * 
-	 * @param startLine
-	 *            line to begin toggle, WRT the viewport.
-	 * @param startCol
-	 *            starting column of region, within startLine
-	 * @param endLine
-	 *            last line to toggle, WRT the viewport.
-	 * @param endCol
-	 *            ending column to toggle, within endLine
-	 * @param attribute
-	 *            the attribute to reverse
-	 * @see #setAttribute
-	 * @see #clearAttribute
-	 * @author mparadise
-	 */
-	public void toggleAttributeStateForRange(int startLine, int startCol,
-			int endLine, int endCol, int attribute) {
-		// @todo for performance, might a vector be better for lines only?
-		// This would prevent a lot of array copies when we scroll/move
-		startLine = checkBounds(startLine, 0, height - 1);
-		endLine = checkBounds(endLine, 0, height - 1);
-		startCol = checkBounds(startCol, 0, width - 1);
-		endCol = checkBounds(endCol, 0, width - 1);
-		int lineStep = endLine < startLine ? -1 : 1;
-		int colStep = endCol < startCol ? -1 : 1;
-
-		// Sanity check - don't allow invalid selection range.
-		if (startLine == endLine) {
-			int line = screenBase + startLine;
-			for (int col = startCol; col < endCol; col += colStep) {
-				toggleAttribute(line, col, attribute);
-			}
-		} else {
-			int stopLine = endLine + screenBase;
-			for (int line = startLine + screenBase; line < stopLine; line += lineStep) {
-				int stopCol;
-				int beginCol;
-				if (line == startLine) {
-					stopCol = width;
-					beginCol = startCol;
-				} else if (line == stopLine) {
-					stopCol = endCol;
-					beginCol = 0;
-				} else {
-					stopCol = width;
-					beginCol = 0;
-				}
-				for (int col = beginCol; col < stopCol; col += colStep) {
-					toggleAttribute(line, col, attribute);
-				}
-			}
-		}
-		setLineDirty(startLine, endLine - startLine);
-	}
-
-	/**
-	 * Returns a StringBuffer containing characters that have the specified
-	 * attribute(s).
-	 * 
-	 * @param attribute
-	 *            attribute(s) to check for.
-	 * @param addNewlines
-	 *            if true, a newline will be appended to the return string every
-	 *            time a character included is on a different line than the last
-	 *            character included.
-	 * @return a string containing all characters with the specified attribute.
-	 * @author mparadise
-	 */
-	public synchronized String getCharactersWithAttributes(long attribute,
-			boolean addNewlines) {
-		// Over-allocate string buffer to contain the matching chars region,
-		// with a newline separating, on the theory that it's better to
-		// allocate too much than not enough (and have to do multiple
-		// array copies internally to the stringbuffer.
-
-		// Note that we're copying the visiible vertical range only.
-		StringBuffer output = new StringBuffer((width + 1) * height);
-		attribute = attribute << 32;
-		int last = -1;
-		int max = Math.min(windowBase + height, bufSize);
-		for (int y = screenBase; y < max; y++) {
-			for (int x = 0; x < width; x++) {
-				if ((terminalData[y][x] & attribute) > 0) {
-					// Append newline for each gap between lines
-					// that have matching attributes.
-					if (addNewlines) {
-						if (last == -1) {
-							last = y;
-						} else if (last != y) {
-							output.append("\n");
-							last = y;
-						}
-					}
-				}
-
-				output.append((char) (terminalData[y][x]));
-
-			}
-		}
-		return output.toString();
-	}
-
 	/**
 	 * Delete a rectangular portion of the screen.
 	 * 
@@ -2809,10 +2655,15 @@ public abstract class VT320 {
 	 * @see #deleteLine
 	 */
 	private void deleteArea(int c, int l, int w, int h, long curAttr) {
-		// Log.debug("emu.deleteArea: " + c + " " + l + " " + w + " " + h);
 
 		c = checkBounds(c, 0, width - 1);
 		l = checkBounds(l, 0, height - 1);
+		if (w > width - c) {
+			w = width - c;
+		}
+		if (w <= 0 || h <= 0) {
+			return;
+		}
 
 		long attr = curAttr << 32;
 
@@ -2823,7 +2674,6 @@ public abstract class VT320 {
 		for (int i = 0; i < h && l + i < height; i++) {
 			System.arraycopy(cbuf, 0, terminalData[screenBase + l + i], c, w);
 		}
-		setLineDirty(l, h);
 	}
 
 	/**
@@ -2832,35 +2682,7 @@ public abstract class VT320 {
 	 * @param doshow
 	 */
 	private void showCursor(boolean doshow) {
-		// Log.debug("emu.showCursor: " + doshow);
-		if (doshow != showcursor) {
-			setLineDirty(cursorY, 1);
-		}
 		showcursor = doshow;
-	}
-
-	/**
-	 * Puts the cursor at the specified position , assuming the values will be
-	 * interpreted as relative to the current viewport.
-	 * 
-	 * @param c
-	 *            column
-	 * @param l
-	 *            line
-	 */
-	private void setCursorPosition(int c, int l) {
-		if (l != cursorY || c != cursorX)
-			setLineDirty(cursorY, 1);
-		cursorX = checkBounds(c, 0, width - 1);
-		cursorY = checkBounds(l, 0, height - 1);
-		setLineDirty(cursorY, 1);
-	}
-
-	/**
-	 * @return total columns
-	 */
-	public int getWidth() {
-		return this.width;
 	}
 
 	/**
@@ -2872,7 +2694,6 @@ public abstract class VT320 {
 	 *            line that is the margin
 	 */
 	public void setTopMargin(int l) {
-		// Log.debug("emu.setTopMargin: " + l);
 		if (l > bottomMargin) {
 			topMargin = bottomMargin;
 			bottomMargin = l;
@@ -2904,7 +2725,6 @@ public abstract class VT320 {
 	 *            line that is the margin
 	 */
 	public void setBottomMargin(int l, boolean remote) {
-		// Log.debug("emu.setBottomMargin: " + l);
 
 		if (l < topMargin) {
 			bottomMargin = topMargin;
@@ -2940,7 +2760,6 @@ public abstract class VT320 {
 	 *            new size of the buffer
 	 */
 	public void setBufferSize(int amount) {
-		Log.debug("emu.setBufferSize: " + amount);
 
 		if (amount < height) {
 			amount = height;
@@ -2960,24 +2779,6 @@ public abstract class VT320 {
 		maxBufSize = amount;
 		numScrollbackLines = maxBufSize - height;
 
-	}
-
-	/**
-	 * Retrieve current scrollback buffer size.
-	 * 
-	 * @see #setBufferSize
-	 */
-	public int getBufferSize() {
-		return bufSize;
-	}
-
-	/**
-	 * Retrieve maximum buffer Size.
-	 * 
-	 * @see #getBufferSize
-	 */
-	public int getMaxBufferSize() {
-		return maxBufSize;
 	}
 
 	/*
@@ -3008,7 +2809,6 @@ public abstract class VT320 {
 	 *            if true indicate that we should request a remote resizing.
 	 */
 	public void setScreenSize(int w, int h, boolean updateRemote) {
-		Log.debug("emu.setScreenSize: " + w + " / " + h);
 		// dumpKeyData("setScreenSize: PRE RESIZE");
 		long cbuf[][];
 		int bsize = bufSize;
@@ -3016,7 +2816,6 @@ public abstract class VT320 {
 			return;
 		}
 		if (w == width && h == height) {
-			Log.debug("emu.setScreenSize: no change, not resizing");
 			return;
 		}
 		if (h > maxBufSize) {
@@ -3068,14 +2867,12 @@ public abstract class VT320 {
 		if (terminalData != null) {
 			for (int i = 0; i < bsize && i < bufSize; i++) {
 				System.arraycopy(terminalData[i], 0, cbuf[i], 0, len);
-				terminalData[i][0] |= XATTR_DIRTY;
 			}
 			long[] empty = new long[w];
 			// Mark the remaining un-used lines dirty as well - and clear them
 			// out sot aht they don't remain on screen.
 			for (int i = bsize; i < bufSize; i++) {
 				System.arraycopy(empty, 0, cbuf[i], 0, w);
-				cbuf[i][0] |= XATTR_DIRTY;
 
 			}
 		}
@@ -3089,6 +2886,9 @@ public abstract class VT320 {
 		// so that it keeps a relative position that's the same
 		width = w;
 		height = h;
+		if (Tabs != null && Tabs.length < w) {
+			resetTabs();
+		}
 		topMargin = 0;
 
 		// First reset our top margin. The new screen dimensions could run afoul
@@ -3120,44 +2920,6 @@ public abstract class VT320 {
 
 	}
 
-	/**
-	 * Mark lines to be updated by the renderer
-	 * 
-	 * @param l
-	 *            starting line
-	 * @param n
-	 *            amount of lines to be updated
-	 */
-	public void setLineDirty(int l, int n) {
-		// @todo by expanding attributes to long, we can just use
-		// a attribute here and save the extra array.
-		// Or by using a Character class... either way will give us
-		// character-level dirty controls.
-		l = checkBounds(l, 0, height - 1);
-		int max = Math.min(l + n, height);
-
-		for (int line = l; line < max; line++) {
-			terminalData[line][0] |= XATTR_DIRTY;
-		}
-
-	}
-
-	public boolean isLineDirty(int line) {
-		line = checkBounds(line, 0, height - 1);
-		return (terminalData[line][0] & XATTR_DIRTY) > 0;
-	}
-
-	public void setLineDirty(int line) {
-
-		line = checkBounds(line, 0, height - 1);
-		terminalData[line][0] |= XATTR_DIRTY;
-	}
-
-	public void setLineClean(int line) {
-		int newline = line = checkBounds(line, 0, height - 1);
-		terminalData[newline][0] &= (~XATTR_DIRTY);
-	}
-
 	private int checkBounds(int value, int lower, int upper) {
 		if (value < lower) {
 			return lower;
@@ -3166,67 +2928,6 @@ public abstract class VT320 {
 			return upper;
 		}
 		return value;
-	}
-
-	public int getTerminalWidth() {
-		return width;
-	}
-
-	public int getTerminalHeight() {
-		return height;
-	}
-
-	/**
-	 * By default we use VT100 settings for function keys - which use a
-	 * different code for F1-F4. However, many other emulations use a different
-	 * set that's more consistent with F5-F12. This will enable that
-	 * alternative.
-	 */
-	public void setFunctionKeyMode(int mode) {
-		switch (mode) {
-		case FK_VT100:
-			FunctionKey[1] = "\u001bOP";
-			FunctionKey[2] = "\u001bOQ";
-			FunctionKey[3] = "\u001bOR";
-			FunctionKey[4] = "\u001bOS";
-			break;
-		case FK_LINUX_APP_KEYPAD:
-			FunctionKey[1] = "\u001b[11~";
-			FunctionKey[2] = "\u001b[12~";
-			FunctionKey[3] = "\u001b[13~";
-			FunctionKey[4] = "\u001b[14~";
-			break;
-
-		case FK_LINUX:
-			FunctionKey[1] = "\u001b[[A";
-			FunctionKey[2] = "\u001b[[B";
-			FunctionKey[3] = "\u001b[[C";
-			FunctionKey[4] = "\u001b[[D";
-			break;
-		}
-	}
-
-	public void enableAltSendsMeta() {
-		altPrefixesMeta = true;
-	}
-
-	public String getBufferString() {
-		StringBuffer output = new StringBuffer((width + 1) * (height + 1));
-		char c;
-		int max = Math.min(windowBase + height, bufSize);
-		for (int y = windowBase; y < max; y++) {
-			for (int x = 0; x < width; x++) {
-				c = (char) terminalData[y][x];
-				if (c < ' ')
-					continue;
-				output.append(c);
-			}
-			// As long as this isn't a soft-wrapped line, insert a newline
-			if ((terminalData[y][width - 1] & XATTR_WRAP) == 0)
-				output.append("\n");
-
-		}
-		return output.toString();
 	}
 
 	/**
@@ -3242,14 +2943,6 @@ public abstract class VT320 {
 	 */
 	public Object getTermBufferMutex() {
 		return this.termBufferMutex;
-	}
-
-	public void refreshCursorPosition() {
-		setCursorPosition(COLUMN, ROW);
-	}
-
-	public void terminate() {
-		// Perform any cleanup.
 	}
 
 }

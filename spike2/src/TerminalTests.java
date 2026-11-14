@@ -33,6 +33,9 @@ public class TerminalTests {
         dispatchesKeys();
         keepsScrollback();
         mapsCharactersToGlyphs();
+        behavesLikeXterm();
+        typesBeyondAscii();
+        survivesHostileOutput();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -60,6 +63,175 @@ public class TerminalTests {
 
         public void resize() {
         }
+    }
+
+    /**
+     * The server is told this is an xterm, so programs send what the xterm
+     * terminfo entry says to. Each of these was wrong, and each is something a
+     * full-screen program does all the time.
+     */
+    private static void behavesLikeXterm() {
+        Headless t = new Headless(20, 6);
+        // "vpa". ncurses uses it whenever only the row changes.
+        t.putString(esc("[3d") + "v");
+        checkTrue("vertical position is one-based, like every other address",
+            t.getChar(0, 2) == 'v');
+
+        t.putString(esc("[2;4H") + esc("[6n"));
+        checkTrue("the cursor position report is one-based",
+            t.sent.toString().endsWith(esc("[2;4R")));
+
+        Headless insert = new Headless(10, 2);
+        insert.putString("abc" + esc("[1;2H") + esc("[@"));
+        checkTrue("insert-character with no count inserts one",
+            insert.getChar(0, 0) == 'a' && insert.getChar(1, 0) == ' '
+                && insert.getChar(2, 0) == 'b' && insert.getChar(3, 0) == 'c');
+
+        // "38;5;1" is red from the 256-colour palette. Its arguments used to
+        // be read as attributes: 5 is blink, 1 is bold, and no colour was set.
+        Headless colour = new Headless(10, 2);
+        colour.putString(esc("[38;5;1m") + "r" + esc("[0m") + esc("[38;2;0;255;0m") + "g"
+            + esc("[0m") + esc("[90m") + "d" + esc("[0m") + esc("[48;5;4m") + "b");
+        checkTrue("a 256-colour foreground sets that colour and nothing else",
+            attributes(colour, 0) == ((1 + 1) << 4));
+        checkTrue("a true-colour foreground becomes the nearest of the sixteen",
+            attributes(colour, 1) == (((2 + 1) << 4) | VT320.BOLD));
+        checkTrue("bright black is drawn, as bold black, rather than dropped",
+            attributes(colour, 2) == (((0 + 1) << 4) | VT320.BOLD));
+        checkTrue("a 256-colour background sets the background",
+            attributes(colour, 3) == ((4 + 1) << 8));
+
+        // "reset" sends this. Honouring it left the emulator 80 columns wide
+        // on a screen, and a pty, that were still 60.
+        Headless narrow = new Headless(10, 3);
+        narrow.putString(esc("[?3l") + "0123456789ab");
+        checkTrue("the width does not change because a program asked",
+            "ab".equals(row(narrow, 1, 2)));
+
+        // What a shell prompt sends to set the window title, in both endings.
+        Headless title = new Headless(20, 2);
+        title.putString(esc("]0;user@host: ~") + "\u0007" + "x"
+            + esc("]0;again") + esc("\\") + "y");
+        checkTrue("a window title is swallowed, whichever way it ends",
+            "xy".equals(row(title, 0, 2)));
+
+        Headless cursor = new Headless(10, 2);
+        cursor.putString(esc("[?25l"));
+        boolean hidden = !cursor.showcursor;
+        cursor.putString(esc("[?25h"));
+        checkTrue("a program can hide the cursor and show it again",
+            hidden && cursor.showcursor);
+    }
+
+    /** The attributes of a cell on the first row. */
+    private static int attributes(VT320 t, int column) {
+        return (int) (t.terminalData[t.screenBase][column] >>> 32);
+    }
+
+    /**
+     * What is typed leaves as UTF-8. It used to leave as the low byte of each
+     * character, which is the same thing only for ASCII.
+     */
+    private static void typesBeyondAscii() {
+        Headless t = new Headless(20, 5);
+        Keyboard keyboard = new Keyboard(t);
+        keyboard.keyPressed(0x015f, 0);
+        checkTrue("a typed s-cedilla is sent as its two UTF-8 bytes",
+            "\u00c5\u009f".equals(t.sent.toString()));
+
+        t.sent.setLength(0);
+        keyboard.keyPressed(0x011f, 0);
+        checkTrue("a typed g-breve is not sent as a control character",
+            "\u00c4\u009f".equals(t.sent.toString()));
+
+        // A pty erases on DEL. ^H works in a shell, whose line editor takes
+        // both, and is typed into anything else that reads a line.
+        t.sent.setLength(0);
+        keyboard.keyPressed(8, 0);
+        checkTrue("Backspace sends DEL, as xterm does",
+            "\u007f".equals(t.sent.toString()));
+    }
+
+    /**
+     * Every byte that reaches the emulator is the server's to choose, and a
+     * `cat` of the wrong file chooses them at random. An exception in here ends
+     * the session, so there must not be one.
+     */
+    private static void survivesHostileOutput() {
+        String[] onceFatal = {
+            esc("[") + repeat("1;", 40) + "m",   // more parameters than slots
+            esc("[99999999999999999999L"),       // a count that overflows an int
+            esc("[2;5r") + esc("[4;1H") + esc("[9L"),   // more lines than the region has
+            esc("[1;20H") + "x" + esc("[5X"),    // erase starting past the edge
+            esc("8"),                            // restore with nothing saved
+            esc("]") + "\\",                   // a terminator with nothing before it
+            esc("P") + "\\",
+            esc("Y") + "\u0001\u0001",         // a VT52 address above the screen
+            esc("[3g") + "\t\t\t\t",
+        };
+        boolean survived = true;
+        for (int i = 0; i < onceFatal.length; i++) {
+            Headless t = new Headless(20, 5);
+            try {
+                t.putString(onceFatal[i] + "ok");
+            } catch (RuntimeException e) {
+                System.out.println("        sequence " + i + " threw " + e);
+                survived = false;
+            }
+        }
+        checkTrue("the sequences that used to throw no longer do", survived);
+
+        // Random input, weighted towards what starts and continues an escape
+        // sequence. Seeded, so a failure here is the same failure every run.
+        String alphabet = esc("") + esc("") + "[[[;;;0123456789?=>!#()*+$'\"hlmHJKABCDGLMPSTXZ@"
+            + "abcdefgnpqrstuxy\r\n\t\u0008\u0007\u000e\u000f\u009b\u0090\u009c\u009d"
+            + "\u0084\u0085\u0088\u008d\u008e\u008fş─ ]\\^_";
+        java.util.Random random = new java.util.Random(20261114L);
+        String firstFailure = null;
+        for (int round = 0; round < 20000 && firstFailure == null; round++) {
+            int columns = 1 + random.nextInt(80);
+            int rows = 1 + random.nextInt(30);
+            Headless t = new Headless(columns, rows);
+            t.setScrollbackBufferSize(40);
+            StringBuffer input = new StringBuffer();
+            int length = 1 + random.nextInt(60);
+            for (int i = 0; i < length; i++) {
+                if (random.nextInt(12) == 0) {
+                    input.append(random.nextInt(100000));
+                } else {
+                    input.append(alphabet.charAt(random.nextInt(alphabet.length())));
+                }
+            }
+            try {
+                t.putString(input.toString());
+                if (random.nextInt(4) == 0) {
+                    columns = 1 + random.nextInt(80);
+                    rows = 1 + random.nextInt(30);
+                    t.setScreenSize(columns, rows, true);
+                    t.putString(input.toString());
+                }
+                if (t.ROW < 0 || t.ROW >= rows || t.COLUMN < 0 || t.COLUMN > columns
+                        || t.screenBase < 0 || t.screenBase + rows > t.terminalData.length) {
+                    firstFailure = "round " + round + " left the cursor at " + t.ROW + ","
+                        + t.COLUMN + " on " + columns + "x" + rows;
+                }
+            } catch (RuntimeException e) {
+                firstFailure = "round " + round + " threw " + e;
+            }
+        }
+        if (firstFailure != null) {
+            System.out.println("        " + firstFailure);
+        }
+        checkTrue("twenty thousand random sequences throw nothing and leave the cursor on the screen",
+            firstFailure == null);
+    }
+
+    private static String repeat(String s, int times) {
+        StringBuffer sb = new StringBuffer();
+        for (int i = 0; i < times; i++) {
+            sb.append(s);
+        }
+        return sb.toString();
     }
 
     private static void writesAndReads() {
@@ -288,6 +460,27 @@ public class TerminalTests {
             }
         }
         checkTrue("a line that scrolled off is still in the buffer", foundEarlier);
+
+        // Past its capacity the buffer drops the oldest line for each new one.
+        // The moment it first filled used to lose a line from the middle
+        // instead, and leave the last row of the array unused from then on.
+        Headless full = new Headless(20, 5);
+        full.setScrollbackBufferSize(10);
+        for (int i = 0; i < 40; i++) {
+            full.putString("L" + i + "\r\n");
+        }
+        boolean contiguous = full.screenBase == 10 && full.terminalData.length == 15;
+        for (int line = 0; line + 1 < full.terminalData.length && contiguous; line++) {
+            // Fourteen lines of text and the empty one the cursor is on.
+            String expected = "L" + (26 + line);
+            StringBuffer sb = new StringBuffer();
+            for (int c = 0; c < expected.length(); c++) {
+                sb.append((char) full.terminalData[line][c]);
+            }
+            contiguous = expected.equals(sb.toString());
+        }
+        checkTrue("a full buffer keeps the newest lines, in order, with none missing",
+            contiguous);
     }
 
     /** Feeds one key through the dispatcher and returns what reached the wire. */
