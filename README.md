@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="https://github.com/cobanov/berryssh/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/cobanov/berryssh?color=4d0135&labelColor=1a1a1a"></a>
-  <img alt="tests" src="https://img.shields.io/badge/tests-228%20offline%20%2B%2041%20live-4d0135?labelColor=1a1a1a">
+  <img alt="tests" src="https://img.shields.io/badge/tests-255%20offline%20%2B%2048%20live-4d0135?labelColor=1a1a1a">
   <img alt="hardware" src="https://img.shields.io/badge/Bold%209790-confirmed-4d0135?labelColor=1a1a1a">
   <a href="LICENSE"><img alt="licence" src="https://img.shields.io/badge/licence-GPL--2.0--or--later-4d0135?labelColor=1a1a1a"></a>
 </p>
@@ -19,7 +19,9 @@
 It speaks `curve25519-sha256`, `ssh-ed25519` and
 `chacha20-poly1305@openssh.com` — the algorithms a current OpenSSH offers by
 default, so a phone from 2011 can reach a modern server without that server
-being weakened to meet it.
+being weakened to meet it. That includes OpenSSH's strict key exchange, the
+countermeasure to Terrapin, which the test suite proves against a current
+server rather than an old one.
 
 Target hardware is a **BlackBerry Bold 9790**: a 480×360 screen, a hardware
 QWERTY keyboard, and a real terminal on it.
@@ -28,9 +30,16 @@ QWERTY keyboard, and a real terminal on it.
   CLDC, so the build needs no RIM SDK and the device asks for no certificate.
 - **The cryptography is here**, because CLDC has no `java.security`, no
   `javax.crypto` and no `BigInteger`.
-- **A real terminal** — VT320 emulation drawn from a bitmap font atlas, 60×25,
-  rather than MIDP's three font sizes.
-- **Saved connections and host key trust**, kept in RMS on the handset.
+- **A real terminal** — VT320 emulation, corrected where it differed from the
+  xterm it reports itself as, drawn from a bitmap font atlas, 60×25, rather
+  than MIDP's three font sizes. Turkish goes in and comes
+  out as UTF-8, and the parser is fuzzed: output is the server's to choose, so
+  no sequence of it may end the session.
+- **Saved connections and host key trust**, kept in RMS on the handset. A key
+  that changed is refused, not offered as a question; *Forget host key* in the
+  connection list is the deliberate way past it.
+- **Logs in with what the server takes** — a key, a password, or nothing at
+  all, which is what Tailscale SSH asks for.
 - **Reaches servers it cannot route to**, through an authenticated WebSocket
   bridge.
 
@@ -65,16 +74,22 @@ python3 tools/ota_server.py out
 
 ## Build
 
-No BlackBerry SDK is involved. Dependencies are fetched, not vendored.
+No BlackBerry SDK is involved, and no JDK on this machine either: everything
+runs in a JDK 8 container, so Docker is the only requirement. Dependencies are
+fetched, not vendored.
 
 ```sh
 lib/fetch.sh          # MIDP/CLDC stubs and ProGuard, from Maven Central
 ./build.sh            # -> out/berryssh.jad + berryssh.jar
-tools/make_atlas.sh   # font atlases, only if the character set changes
+./build.sh probe      # -> spike1/out/Probe.*, the capability probe
+tools/make_atlas.sh   # font atlases, only if the character set changes (JDK 11+)
 ```
 
-The compiler is JDK 8 in a container at `-source 1.3 -target 1.3`, because a
-host JDK 17 cannot emit class file version 47 and that is what CLDC wants.
+The compiler runs at `-source 1.3 -target 1.3`, because no current JDK can emit
+class file version 47 and that is what CLDC wants. The build checks for it.
+
+The version is written once, in `Transport.SOFTWARE_VERSION` — the string the
+client announces to the server — and `build.sh` reads it from there.
 
 **Preverification is mandatory.** A MIDlet that is merely compiled installs and
 then fails on the device with:
@@ -90,22 +105,32 @@ CLDC's verifier wants `StackMap` attributes computed ahead of time, and modern
 ## Verify
 
 ```sh
-spike2/run.sh                     # 228 assertions, nothing external needed
-spike2/against-server.sh          # 41 more, against a real OpenSSH
+spike2/run.sh                     # 255 assertions, nothing external needed
+tools/test-server.sh              # a current OpenSSH and the bridge, in a container
+spike2/against-server.sh          # 48 more, against them
 ```
 
 `run.sh` compiles against the CLDC bootclasspath at `-source 1.3` and then runs
-the vectors on the host JVM: compiling under the device's constraints proves the
-code will run there, executing on the host proves it is correct, and neither
-half needs the phone. They run under a Turkish default locale — the device's own,
-and the setting most likely to break protocol code without raising an error
-anywhere.
+the vectors on a desktop JVM: compiling under the device's constraints proves
+the code will run there, executing on a desktop proves it is correct, and
+neither half needs the phone. They run under a Turkish default locale — the
+device's own, and the setting most likely to break protocol code without
+raising an error anywhere. The terminal emulator is fuzzed as part of it:
+twenty thousand random escape sequences, none of which may throw.
 
 Encodings can be proved offline; a protocol cannot. A key exchange either
-convinces OpenSSH or it does not, so the other half talks to one — including a
-server that rekeys every 64 KB and a bridge that has to refuse a wrong key and a
-machine that is not on its list. Absent servers print `SKIP` rather than passing
-quietly.
+convinces OpenSSH or it does not, so the other half talks to one.
+`test-server.sh` builds it from a stock Alpine image, so the server is whatever
+OpenSSH is current rather than one frozen when the tests were written: a server
+that takes a password, one that asks for nothing, one that rekeys every 64 KB
+and takes a key, and a bridge that has to refuse a wrong key, a machine that is
+not on its list and say so when one that is turns out to be down. Keys are
+typed through the emulator into a real tty, which is how a Backspace that
+erased in a shell and nowhere else was found. Absent servers print `SKIP`
+rather than passing quietly.
+
+What none of this covers is the handset itself: the screens, the keyboard
+codes and the RMS stores only exist there.
 
 ## How it is built
 
@@ -129,7 +154,8 @@ interpreted Java on this class of CPU.
 
 ### Measured on the device
 
-`spike1` is a capability probe rather than a hello world. On a Bold 9790:
+`spike1` is a capability probe rather than a hello world (`./build.sh probe`).
+On a Bold 9790:
 
 | | |
 | --- | --- |
@@ -150,7 +176,8 @@ separate implementation with a different architecture and different algorithms,
 but it borrows where BBSSH already got it right, credited in the files that use
 it: the `VT320` emulator (originally from [JTA](http://javatelnet.org/) by
 Matthias L. Jugel and Marcus Meissner) and the `BitmapFont` renderer, derived
-from Roar Lauritzsen's LCDFont.
+from Roar Lauritzsen's LCDFont. The emulator has since been changed where
+fuzzing and a real xterm disagreed with it; its header lists how.
 
 Not the font atlases. Those covered U+0020 to U+00FF and nothing else, leaving
 Turkish `ğ ı ş İ` and the whole box-drawing range without glyphs. They are

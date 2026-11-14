@@ -27,6 +27,11 @@ package berryssh.crypto;
  * refusing to generate is the right behaviour when the pool is short — quietly
  * returning weak bytes is the failure nobody would ever notice.
  *
+ * Synchronized, because two threads reach it: the event thread absorbs
+ * keystrokes while the session thread draws key material for a rekey or a
+ * WebSocket mask, and an absorb interleaved with a ratchet would leave the
+ * state half of each.
+ *
  * Written for -source 1.3: no generics, no enhanced for, no StringBuilder.
  */
 public final class EntropyPool {
@@ -68,16 +73,16 @@ public final class EntropyPool {
     }
 
     /** Conservative estimate of the entropy absorbed so far, capped at the requirement. */
-    public int seededBits() {
+    public synchronized int seededBits() {
         return bits;
     }
 
-    public boolean isSeeded() {
+    public synchronized boolean isSeeded() {
         return bits >= REQUIRED_BITS;
     }
 
     /** Absorbs data without crediting it. For values an attacker might guess. */
-    public void addSample(byte[] data) {
+    public synchronized void addSample(byte[] data) {
         SHA256 h = new SHA256();
         h.update(state);
         h.update(new byte[] { ABSORB });
@@ -105,7 +110,7 @@ public final class EntropyPool {
      * The unpredictable part is when the key was pressed rather than which key
      * it was, so both go in but the credit is for the timing.
      */
-    public void addKeystroke(int keyCode) {
+    public synchronized void addKeystroke(int keyCode) {
         addSample(longToBytes(System.currentTimeMillis()));
         addSample(longToBytes(keyCode));
         addSample(longToBytes(Runtime.getRuntime().freeMemory()));
@@ -157,7 +162,7 @@ public final class EntropyPool {
      *
      * @throws IllegalStateException if the pool has not reached {@link #REQUIRED_BITS}
      */
-    public byte[] nextBytes(int length) {
+    public synchronized byte[] nextBytes(int length) {
         if (!isSeeded()) {
             throw new IllegalStateException(
                 "random source has " + bits + " of " + REQUIRED_BITS + " bits; refusing to generate");
@@ -200,7 +205,7 @@ public final class EntropyPool {
         System.arraycopy(next, 0, state, 0, state.length);
     }
 
-    private void credit(int n) {
+    private synchronized void credit(int n) {
         if (bits < REQUIRED_BITS) {
             bits += n;
             if (bits > REQUIRED_BITS) {

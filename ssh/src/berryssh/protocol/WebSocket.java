@@ -186,7 +186,9 @@ public final class WebSocket {
                     length = (length << 8) | readByte();
                 }
             }
-            if (length > 1024L * 1024L) {
+            // Below zero as well: a 64-bit length with its top bit set is
+            // negative here, and would otherwise reach the allocation.
+            if (length < 0 || length > 1024L * 1024L) {
                 throw new SshException("the bridge sent a " + length + " byte frame");
             }
 
@@ -231,6 +233,11 @@ public final class WebSocket {
 
     private void append(byte[] data) {
         int left = pending.length - pendingAt;
+        if (left == 0) {
+            pending = data;
+            pendingAt = 0;
+            return;
+        }
         byte[] combined = new byte[left + data.length];
         System.arraycopy(pending, pendingAt, combined, 0, left);
         System.arraycopy(data, 0, combined, left, data.length);

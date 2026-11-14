@@ -203,12 +203,6 @@ public final class BitmapFont {
         g.drawRGB(current, offset, imageWidth, x, y, cellWidth, cellHeight, false);
     }
 
-    /** Fills one cell with the background colour, for a blank or a cleared line. */
-    public void fillCell(Graphics g, int x, int y, int background) {
-        g.setColor(background);
-        g.fillRect(x, y, cellWidth, cellHeight);
-    }
-
     /**
      * The cell a character occupies in the layout, or -1 if it has none.
      *

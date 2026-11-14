@@ -37,6 +37,16 @@ public class ServerTests {
     private static String password = "bbssh";
     private static int rekeyPort = 2223;
 
+    /** What `ssh-keygen -lf` prints for the server's host key, when we were told. */
+    private static String expectedFingerprint;
+
+    /** A user the test server lets in without asking for anything. */
+    private static final String OPEN_USER = "open";
+
+    /** RFC 8032 test vector 3: the key the rekeying server authorises. */
+    private static final String AUTHORISED_SEED =
+        "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7";
+
     private static int passed;
     private static int failed;
 
@@ -51,6 +61,9 @@ public class ServerTests {
             user = args[2];
             password = args[3];
         }
+        if (args.length >= 5) {
+            expectedFingerprint = args[4];
+        }
 
         System.out.println("  ..    against " + host + ":" + port);
         negotiatesWithRealServer();
@@ -62,9 +75,12 @@ public class ServerTests {
         survivesTypingWhileOutputArrives();
         survivesARekey();
         authenticatesWithAKey();
+        logsInWithWhateverTheServerTakes();
+        typesWhatATerminalTypes();
         leavesPolitely();
         reachesAServerThroughAWebSocket();
         refusesAWrongBridgeKey();
+        isToldWhenATargetIsDown();
 
         System.out.println();
         System.out.println(passed + " passed, " + failed + " failed");
@@ -157,8 +173,16 @@ public class ServerTests {
             System.out.println("        host key is " + key.fingerprint());
             checkTrue("the host key is ssh-ed25519 and 32 bytes",
                 key.publicKey().length == 32);
-            checkTrue("the fingerprint is the one ssh-keygen prints for this server",
-                "SHA256:9tqjakW/Ia6U4hT3VgAv8EXXCxC1d3ez9mr5qjVTRZs".equals(key.fingerprint()));
+            // The comparison a person makes on first contact. The expected
+            // value comes from ssh-keygen on the server, by way of
+            // against-server.sh, not from a constant that would only ever
+            // match one container.
+            if (expectedFingerprint == null) {
+                System.out.println("  SKIP  fingerprint: not told what ssh-keygen prints");
+            } else {
+                checkTrue("the fingerprint is the one ssh-keygen prints for this server",
+                    expectedFingerprint.equals(key.fingerprint()));
+            }
 
             // Derivation cannot be checked against the server until the cipher
             // is in place, but its shape can: the labels must produce distinct
@@ -207,6 +231,21 @@ public class ServerTests {
             // packets past NEWKEYS is that agreement holding.
             System.out.println("        " + connection.transport().sendSequence()
                 + " packets sent, " + connection.transport().receiveSequence() + " received");
+
+            // Under strict key exchange both counters restarted at NEWKEYS, so
+            // the service request and its reply are packet zero each way. The
+            // proof that the server counted the same is that the reply
+            // decrypted at all: the counter is the nonce.
+            Handshake h = upToKexInit();
+            boolean serverIsStrict = h.theirs.offersStrictKex();
+            h.socket.close();
+            if (serverIsStrict) {
+                checkTrue("strict key exchange is in force and the server agrees on the count",
+                    connection.transport().sendSequence() == 1
+                        && connection.transport().receiveSequence() == 1);
+            } else {
+                System.out.println("  SKIP  strict key exchange: this server predates it");
+            }
         } finally {
             socket.close();
         }
@@ -255,7 +294,7 @@ public class ServerTests {
             // is that the request and key blob are well formed enough for the
             // server to read the key out and name it in its log.
             UserAuth.Result byKey = auth.publicKey(
-                hex("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7"));
+                hex(AUTHORISED_SEED));
             checkTrue("an unauthorised publickey request is parsed and refused",
                 !byKey.succeeded() && byKey.methodsThatCanContinue().length > 0);
 
@@ -539,7 +578,7 @@ public class ServerTests {
      * visible reason.
      *
      * Waiting an hour is not a test, so this runs against a throwaway server
-     * with RekeyLimit set to 64 KB (tools/rekey-server.sh). It is deliberately
+     * with RekeyLimit set to 64 KB (tools/test-server.sh). It is deliberately
      * not the shared container: that one is what the handset connects to.
      */
     private static void survivesARekey() throws Exception {
@@ -548,7 +587,7 @@ public class ServerTests {
             socket = new Socket(host, rekeyPort);
         } catch (IOException e) {
             System.out.println("  SKIP  rekey: nothing on " + host + ":" + rekeyPort
-                + " (tools/rekey-server.sh)");
+                + " (tools/test-server.sh)");
             return;
         }
         try {
@@ -639,7 +678,7 @@ public class ServerTests {
             socket = new Socket(host, rekeyPort);
         } catch (IOException e) {
             System.out.println("  SKIP  publickey: nothing on " + host + ":" + rekeyPort
-                + " (tools/rekey-server.sh)");
+                + " (tools/test-server.sh)");
             return;
         }
         try {
@@ -654,7 +693,7 @@ public class ServerTests {
             auth.begin();
             auth.queryMethods();
 
-            byte[] seed = hex("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7");
+            byte[] seed = hex(AUTHORISED_SEED);
             checkTrue("OpenSSH accepts a signature we made", auth.publicKey(seed).succeeded());
 
             // And a key the server has not been given must be refused, or the
@@ -682,6 +721,144 @@ public class ServerTests {
     }
 
     /** What tools/wsbridge-test.json is started with. Not a secret; a fixture. */
+    /** A handshake carried up to the point where the user has to be proved. */
+    private static UserAuth readyToAuthenticate(Socket socket, String who) throws IOException {
+        socket.setSoTimeout(15000);
+        EntropyPool random = new EntropyPool();
+        random.seed();
+        Connection connection = new Connection(
+            socket.getInputStream(), socket.getOutputStream(), random);
+        connection.handshake();
+        UserAuth auth = new UserAuth(connection, who);
+        auth.begin();
+        return auth;
+    }
+
+    /**
+     * {@link UserAuth#authenticate} against each kind of server there is: one
+     * that wants nothing, one that takes the key, and one that refuses the key
+     * and takes the password after it.
+     */
+    private static void logsInWithWhateverTheServerTakes() throws Exception {
+        byte[] seed = hex(AUTHORISED_SEED);
+
+        // The server that asks for nothing. Its answer to `none` is success,
+        // and anything sent after that is sent to a server that has moved on —
+        // which is how this used to end, with the key waiting for a reply.
+        Socket socket = new Socket(host, port);
+        try {
+            UserAuth auth = readyToAuthenticate(socket, OPEN_USER);
+            UserAuth.Result result = auth.authenticate(seed, "a password nobody asked for");
+            if (!result.succeeded()) {
+                System.out.println("  SKIP  no-authentication login: this server has no `"
+                    + OPEN_USER + "` user that needs none");
+            } else {
+                checkTrue("a server that asks for nothing is taken at its word", true);
+            }
+        } finally {
+            socket.close();
+        }
+
+        // The key is refused here, and the password is the fallback.
+        socket = new Socket(host, port);
+        try {
+            UserAuth auth = readyToAuthenticate(socket, user);
+            checkTrue("a refused key falls back to the password",
+                auth.authenticate(seed, password).succeeded());
+        } finally {
+            socket.close();
+        }
+
+        socket = new Socket(host, port);
+        try {
+            UserAuth auth = readyToAuthenticate(socket, user);
+            UserAuth.Result result = auth.authenticate(null, "not the password");
+            checkTrue("a failure says what the server would have accepted",
+                !result.succeeded() && result.offers("password")
+                    && result.describeMethods().indexOf("password") >= 0);
+        } finally {
+            socket.close();
+        }
+
+        try {
+            socket = new Socket(host, rekeyPort);
+        } catch (IOException e) {
+            System.out.println("  SKIP  key login: nothing on " + host + ":" + rekeyPort);
+            return;
+        }
+        try {
+            UserAuth auth = readyToAuthenticate(socket, user);
+            checkTrue("an authorised key logs in without the password being sent",
+                auth.authenticate(seed, "").succeeded());
+        } finally {
+            socket.close();
+        }
+    }
+
+    /**
+     * The keys a person presses, through the emulator, to a real tty.
+     *
+     * `cat` is the reader here because it has no line editor: what it is given
+     * is whatever the tty's own line discipline made of the keystrokes, which
+     * is what a password prompt gets too.
+     */
+    private static void typesWhatATerminalTypes() throws Exception {
+        Socket socket = new Socket(host, port);
+        try {
+            UserAuth auth = readyToAuthenticate(socket, user);
+            auth.authenticate(null, password);
+            final Channel channel = Channel.openSession(auth.connection());
+            channel.requestPty("xterm", 60, 25);
+            channel.requestShell();
+            VT320 terminal = new VT320(60, 25) {
+                public void sendData(byte[] b, int offset, int length) throws IOException {
+                    channel.write(b, offset, length);
+                }
+
+                public void beep() {
+                }
+
+                public void resize() {
+                }
+            };
+            berryssh.device.Keyboard keyboard = new berryssh.device.Keyboard(terminal);
+
+            // UTF-8 input mode, so the tty erases a two-byte character whole.
+            channel.write(Utf8.encode("stty iutf8; cat > /tmp/typed; od -An -tx1 /tmp/typed; exit\n"));
+            Thread.sleep(500);
+            type(keyboard, "ab");
+            keyboard.keyPressed(8, 0);          // Backspace
+            type(keyboard, "c\u015f");          // c, s-cedilla
+            keyboard.keyPressed(10, 0);         // Enter
+            keyboard.toggleControl();
+            keyboard.keyPressed('d', 0);        // Ctrl-D ends cat
+
+            StringBuffer output = new StringBuffer();
+            byte[] buffer = new byte[4096];
+            for (;;) {
+                int n = channel.read(buffer, 0, buffer.length);
+                if (n < 0) {
+                    break;
+                }
+                output.append(Utf8.decode(buffer, 0, n));
+            }
+            // "a", "c", the two bytes of s-cedilla, and the newline. The "b"
+            // is gone because Backspace erased it; with ^H it stayed, followed
+            // by an 0x08.
+            checkTrue("Backspace erases on a real tty, and a Turkish letter arrives as UTF-8",
+                output.toString().indexOf("61 63 c5 9f 0a") >= 0);
+            channel.close();
+        } finally {
+            socket.close();
+        }
+    }
+
+    private static void type(berryssh.device.Keyboard keyboard, String text) {
+        for (int i = 0; i < text.length(); i++) {
+            keyboard.keyPressed(text.charAt(i), 0);
+        }
+    }
+
     private static final String BRIDGE_KEY = "spike2-bridge-key-not-a-secret";
     private static final String BRIDGE_TARGET = "testserver";
 
@@ -698,6 +875,43 @@ public class ServerTests {
      * client, which is the point — a client tested against its own idea of the
      * protocol proves nothing.
      */
+    /**
+     * A machine that is on the bridge's list but switched off. The bridge used
+     * to just close the connection, which on the handset read as a bridge that
+     * had broken rather than a server that was down.
+     */
+    private static void isToldWhenATargetIsDown() throws Exception {
+        Socket socket;
+        try {
+            socket = new Socket(host, 8090);
+        } catch (IOException e) {
+            System.out.println("  SKIP  unreachable target: nothing on " + host + ":8090");
+            return;
+        }
+        try {
+            socket.setSoTimeout(20000);
+            EntropyPool random = new EntropyPool();
+            random.seed();
+            WebSocket ws = WebSocket.connect(socket.getInputStream(), socket.getOutputStream(),
+                host + ":8090", "/", random);
+            String[] targets = BridgeAuth.authenticate(
+                ws.inputStream(), ws.outputStream(), BRIDGE_KEY);
+            if (!contains(targets, "down")) {
+                System.out.println("  SKIP  unreachable target: this bridge lists no `down`");
+                return;
+            }
+            try {
+                BridgeAuth.open(ws.inputStream(), ws.outputStream(), "down");
+                checkTrue("a target that is down is reported as unreachable", false);
+            } catch (IOException e) {
+                checkTrue("a target that is down is reported as unreachable",
+                    e.getMessage().indexOf("down is unreachable") >= 0);
+            }
+        } finally {
+            socket.close();
+        }
+    }
+
     private static void reachesAServerThroughAWebSocket() throws Exception {
         Socket socket;
         try {
@@ -725,8 +939,12 @@ public class ServerTests {
             // reason Connection was built to take streams.
             Connection connection = new Connection(ws.inputStream(), ws.outputStream(), random);
             HostKey key = connection.handshake();
+            // The same server as the direct tests, so the same key: a bridge
+            // that swapped the host key for its own would show up here.
             checkTrue("the key exchange completes through the WebSocket",
-                "SHA256:9tqjakW/Ia6U4hT3VgAv8EXXCxC1d3ez9mr5qjVTRZs".equals(key.fingerprint()));
+                expectedFingerprint == null
+                    ? key.fingerprint().startsWith("SHA256:")
+                    : expectedFingerprint.equals(key.fingerprint()));
 
             UserAuth auth = new UserAuth(connection, user);
             auth.begin();

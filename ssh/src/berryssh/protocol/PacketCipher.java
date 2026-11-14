@@ -100,34 +100,39 @@ public final class PacketCipher {
      * Authenticates and then decrypts. In that order, and not the other way:
      * plaintext derived from an unauthenticated packet must never reach the
      * parser above, or the tag is decoration.
+     *
+     * The body is decrypted in place and returned, so {@code encryptedBody}
+     * holds plaintext afterwards.
      */
     public byte[] open(long sequence, byte[] encryptedLength, byte[] encryptedBody, byte[] tag)
             throws IOException {
         byte[] nonce = nonce(sequence);
 
-        byte[] authenticated = new byte[LENGTH_FIELD_LENGTH + encryptedBody.length];
-        System.arraycopy(encryptedLength, 0, authenticated, 0, LENGTH_FIELD_LENGTH);
-        System.arraycopy(encryptedBody, 0, authenticated, LENGTH_FIELD_LENGTH, encryptedBody.length);
-
-        byte[] expected = authenticate(nonce, authenticated, authenticated.length);
-        if (!Bytes.equal(expected, tag)) {
+        // The tag covers the encrypted length and then the encrypted body. The
+        // MAC takes them as two updates, so they need not be joined first.
+        Poly1305 mac = mac(nonce);
+        mac.update(encryptedLength, 0, LENGTH_FIELD_LENGTH);
+        mac.update(encryptedBody, 0, encryptedBody.length);
+        if (!Bytes.equal(mac.finish(), tag)) {
             throw new SshException("packet authentication failed");
         }
 
-        byte[] body = new byte[encryptedBody.length];
-        System.arraycopy(encryptedBody, 0, body, 0, encryptedBody.length);
-        new ChaCha20(bodyKey, nonce, 1).process(body, 0, body.length);
-        return body;
+        // In place: the caller read this array for us and keeps nothing of it.
+        new ChaCha20(bodyKey, nonce, 1).process(encryptedBody, 0, encryptedBody.length);
+        return encryptedBody;
+    }
+
+    private byte[] authenticate(byte[] nonce, byte[] data, int length) {
+        Poly1305 mac = mac(nonce);
+        mac.update(data, 0, length);
+        return mac.finish();
     }
 
     /** The Poly1305 key is block zero of the body key stream, freshly per packet. */
-    private byte[] authenticate(byte[] nonce, byte[] data, int length) {
+    private Poly1305 mac(byte[] nonce) {
         byte[] key = new byte[POLY1305_KEY_LENGTH];
         new ChaCha20(bodyKey, nonce, 0).process(key, 0, POLY1305_KEY_LENGTH);
-
-        Poly1305 mac = new Poly1305(key);
-        mac.update(data, 0, length);
-        return mac.finish();
+        return new Poly1305(key);
     }
 
     // The tag comparison lives in Bytes, with the other three that used to be

@@ -84,7 +84,13 @@ public final class Channel {
                 r.readUint32();
                 channel.remoteId = (int) r.readUint32();
                 channel.remoteWindow = r.readUint32();
-                channel.remoteMaxPacket = (int) r.readUint32();
+                long maxPacket = r.readUint32();
+                if (maxPacket < 1) {
+                    // write() sends at most this much at a time, so zero would
+                    // be a loop that sends nothing for ever.
+                    throw new SshException("the server allows packets of no size");
+                }
+                channel.remoteMaxPacket = maxPacket > MAX_PACKET ? MAX_PACKET : (int) maxPacket;
                 return channel;
             }
             if (type == Message.CHANNEL_OPEN_FAILURE) {
@@ -378,6 +384,13 @@ public final class Channel {
 
     private void append(byte[] data) {
         int left = pending.length - pendingAt;
+        if (left == 0) {
+            // The usual case: everything before was read. The packet's own
+            // array becomes the buffer and nothing is copied.
+            pending = data;
+            pendingAt = 0;
+            return;
+        }
         byte[] combined = new byte[left + data.length];
         System.arraycopy(pending, pendingAt, combined, 0, left);
         System.arraycopy(data, 0, combined, left, data.length);

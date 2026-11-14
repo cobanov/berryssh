@@ -56,9 +56,6 @@ public final class SHA512 {
         byteCount = 0;
     }
 
-    public void update(byte[] input) {
-        update(input, 0, input.length);
-    }
 
     public void update(byte[] input, int offset, int length) {
         byteCount += length;

@@ -18,6 +18,15 @@ import berryssh.crypto.EntropyPool;
 public final class KexInit {
 
     /**
+     * Not algorithms. Each side lists its own marker among the key exchange
+     * names to say it implements strict key exchange, and the rule is in force
+     * when both have. They cannot be negotiated as a method by accident: the
+     * two names differ, so neither list ever contains the other's.
+     */
+    public static final String STRICT_CLIENT = "kex-strict-c-v00@openssh.com";
+    public static final String STRICT_SERVER = "kex-strict-s-v00@openssh.com";
+
+    /**
      * What we offer. Each list is in preference order, and the order is the
      * negotiation: the first entry that the server also names wins.
      *
@@ -27,7 +36,8 @@ public final class KexInit {
      */
     public static final String[] KEX_ALGORITHMS = {
         "curve25519-sha256",
-        "curve25519-sha256@libssh.org"
+        "curve25519-sha256@libssh.org",
+        STRICT_CLIENT
     };
 
     public static final String[] HOST_KEY_ALGORITHMS = {
@@ -65,15 +75,12 @@ public final class KexInit {
     private final String[] hostKeyAlgorithms;
     private final String[] ciphersClientToServer;
     private final String[] ciphersServerToClient;
-    private final String[] macsClientToServer;
-    private final String[] macsServerToClient;
     private final String[] compressionClientToServer;
     private final String[] compressionServerToClient;
     private final boolean firstKexPacketFollows;
 
     private KexInit(byte[] payload, String[] kexAlgorithms, String[] hostKeyAlgorithms,
                     String[] ciphersClientToServer, String[] ciphersServerToClient,
-                    String[] macsClientToServer, String[] macsServerToClient,
                     String[] compressionClientToServer, String[] compressionServerToClient,
                     boolean firstKexPacketFollows) {
         this.payload = payload;
@@ -81,8 +88,6 @@ public final class KexInit {
         this.hostKeyAlgorithms = hostKeyAlgorithms;
         this.ciphersClientToServer = ciphersClientToServer;
         this.ciphersServerToClient = ciphersServerToClient;
-        this.macsClientToServer = macsClientToServer;
-        this.macsServerToClient = macsServerToClient;
         this.compressionClientToServer = compressionClientToServer;
         this.compressionServerToClient = compressionServerToClient;
         this.firstKexPacketFollows = firstKexPacketFollows;
@@ -117,7 +122,7 @@ public final class KexInit {
 
         return new KexInit(w.toByteArray(),
             KEX_ALGORITHMS, HOST_KEY_ALGORITHMS, CIPHERS, CIPHERS,
-            MACS, MACS, COMPRESSION, COMPRESSION, false);
+            COMPRESSION, COMPRESSION, false);
     }
 
     public static KexInit parse(byte[] payload) throws IOException {
@@ -132,8 +137,10 @@ public final class KexInit {
         String[] hostKey = r.readNameList();
         String[] cipherCtoS = r.readNameList();
         String[] cipherStoC = r.readNameList();
-        String[] macCtoS = r.readNameList();
-        String[] macStoC = r.readNameList();
+        // The MAC lists. An AEAD cipher carries its own tag, so they are read
+        // past and never consulted — see MACS.
+        r.readNameList();
+        r.readNameList();
         String[] compCtoS = r.readNameList();
         String[] compStoC = r.readNameList();
         r.readNameList();
@@ -142,7 +149,7 @@ public final class KexInit {
         r.readUint32();
 
         return new KexInit(payload, kex, hostKey, cipherCtoS, cipherStoC,
-            macCtoS, macStoC, compCtoS, compStoC, guessing);
+            compCtoS, compStoC, guessing);
     }
 
     /** The payload exactly as it went on the wire, for the exchange hash. */
@@ -166,14 +173,6 @@ public final class KexInit {
         return ciphersServerToClient;
     }
 
-    public String[] macsClientToServer() {
-        return macsClientToServer;
-    }
-
-    public String[] macsServerToClient() {
-        return macsServerToClient;
-    }
-
     public String[] compressionClientToServer() {
         return compressionClientToServer;
     }
@@ -184,5 +183,15 @@ public final class KexInit {
 
     public boolean firstKexPacketFollows() {
         return firstKexPacketFollows;
+    }
+
+    /** Whether the server's KEXINIT asks for strict key exchange. */
+    public boolean offersStrictKex() {
+        for (int i = 0; i < kexAlgorithms.length; i++) {
+            if (STRICT_SERVER.equals(kexAlgorithms[i])) {
+                return true;
+            }
+        }
+        return false;
     }
 }

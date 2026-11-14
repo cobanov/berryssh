@@ -13,16 +13,19 @@ import java.util.Random;
  * java.io streams so the whole framing layer can be exercised on the host
  * against a pair of byte arrays, with no device and no server involved.
  *
- * The packets are still in the clear here. Once the key exchange has run,
- * chacha20-poly1305 replaces both the padding rules and the length field's
- * encoding, because that cipher encrypts the length separately — so this is a
- * seam the cipher work will reopen, not a finished layer.
+ * Packets start in the clear. From NEWKEYS on, each direction is sealed by a
+ * {@link PacketCipher}, which changes the padding rule and encrypts the length
+ * field separately — see {@link #pad} and {@link #readLocked}.
  *
  * Written for -source 1.3: no generics, no enhanced for, no StringBuilder.
  */
 public final class Transport {
 
-    public static final String SOFTWARE_VERSION = "berryssh_0.1";
+    /**
+     * What the server is told we are, and the one place the version is written:
+     * build.sh reads the number out of this line for the jar and descriptor.
+     */
+    public static final String SOFTWARE_VERSION = "berryssh_0.9.0";
 
     private static final String IDENTIFICATION = "SSH-2.0-" + SOFTWARE_VERSION;
 
@@ -85,6 +88,12 @@ public final class Transport {
 
     private RekeyHandler rekeyHandler;
 
+    /** Sequence numbers restart at every NEWKEYS. See {@link #enableStrictKex}. */
+    private boolean strictKex;
+
+    /** Until the first NEWKEYS arrives, nothing that is not key exchange may. */
+    private boolean strictInitialExchange;
+
     private String clientVersion;
     private String serverVersion;
     private long sendSequence;
@@ -140,14 +149,42 @@ public final class Transport {
         return sendLock;
     }
 
+    /**
+     * Turns on OpenSSH's strict key exchange, once both KEXINITs have named it.
+     *
+     * It closes the Terrapin attack (CVE-2023-48795). The sequence number that
+     * serves as the AEAD nonce also counts the packets sent before encryption
+     * began, which nothing authenticates — so someone in the path could insert
+     * an IGNORE there and delete the first encrypted packet, and the numbers
+     * would still line up. Two rules remove that: during the first exchange
+     * nothing but key exchange messages is accepted, and the counters go back
+     * to zero at every NEWKEYS, so nothing from before the keys carries over.
+     */
+    public void enableStrictKex() throws IOException {
+        // The server's KEXINIT has just been read. If it was not the very first
+        // packet, something came before it, and under this rule nothing may.
+        if (receiveSequence != 1) {
+            throw new SshException("the server's KEXINIT was not its first packet");
+        }
+        strictKex = true;
+        strictInitialExchange = true;
+    }
+
     /** Takes effect from the next packet we send. Call it straight after sending NEWKEYS. */
     public void encryptOutgoing(PacketCipher cipher) {
         this.outgoing = cipher;
+        if (strictKex) {
+            sendSequence = 0;
+        }
     }
 
     /** Takes effect from the next packet we read. Call it straight after reading NEWKEYS. */
     public void decryptIncoming(PacketCipher cipher) {
         this.incoming = cipher;
+        if (strictKex) {
+            receiveSequence = 0;
+        }
+        strictInitialExchange = false;
     }
 
     /**
@@ -331,6 +368,10 @@ public final class Transport {
             }
             int type = payload[0] & 0xff;
             if (type == Message.IGNORE || type == Message.DEBUG) {
+                if (strictInitialExchange) {
+                    throw new SshException(Message.name(type)
+                        + " during a strict key exchange");
+                }
                 continue;
             }
             if (type == Message.KEXINIT && rekeyHandler != null) {

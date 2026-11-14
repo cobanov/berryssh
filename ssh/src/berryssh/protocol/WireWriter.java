@@ -24,10 +24,6 @@ public final class WireWriter {
         buf = new byte[capacity < 16 ? 16 : capacity];
     }
 
-    public int length() {
-        return pos;
-    }
-
     public byte[] toByteArray() {
         byte[] out = new byte[pos];
         System.arraycopy(buf, 0, out, 0, pos);
